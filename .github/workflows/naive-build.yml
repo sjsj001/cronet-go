@@ -36,12 +36,40 @@ jobs:
       - name: Get Chromium version
         id: chromium
         run: echo "version=$(cat naiveproxy/CHROMIUM_VERSION)" >> $GITHUB_OUTPUT
+      - name: Patch naiveproxy and SPDY limits
+        run: |
+          set -e
+
+          # Patch naive_proxy_bin.cc
+          FILE1="naiveproxy/src/net/tools/naive/naive_proxy_bin.cc"
+          sed -i 's/constexpr int kMaxBandwidthMBps = 125;/constexpr int kMaxBandwidthMBps = 250;/' "$FILE1"
+          echo "Patched kMaxBandwidthMBps:"
+          grep "kMaxBandwidthMBps" "$FILE1"
+
+          # Patch http_network_session.cc
+          FILE2="naiveproxy/src/net/http/http_network_session.cc"
+          sed -i 's/const int32_t kSpdySessionMaxRecvWindowSize = 15 \* 1024 \* 1024;/const int32_t kSpdySessionMaxRecvWindowSize = 256 * 1024 * 1024;/' "$FILE2"
+          sed -i 's/const int32_t kSpdyStreamMaxRecvWindowSize = 6 \* 1024 \* 1024;/const int32_t kSpdyStreamMaxRecvWindowSize = 128 * 1024 * 1024;/' "$FILE2"
+          echo "Patched SPDY recv window sizes:"
+          grep "kSpdy" "$FILE2"
+
+          # Patch spdy_session.h
+          FILE3="naiveproxy/src/net/spdy/spdy_session.h"
+          sed -i 's/const int32_t kDefaultInitialWindowSize = 65535;/const int32_t kDefaultInitialWindowSize = 128 * 1024 * 1024;/' "$FILE3"
+          echo "Patched kDefaultInitialWindowSize:"
+          grep "kDefaultInitialWindowSize" "$FILE3"
+
+          FILE="naiveproxy/src/net/socket/tcp_socket_posix.cc"
+          sed -i '/PLOG(ERROR) << "Failed to set TCP_KEEPIDLE on fd: "/d' "$FILE"
+          
+          echo "Patched TCP_KEEPIDLE log:"
+          grep -n "TCP_KEEPIDLE" "$FILE"
       - name: Cache build artifacts
         id: build-cache
         uses: actions/cache@v4
         with:
           path: naiveproxy/src/out
-          key: naive-build-${{ steps.naive.outputs.commit }}-${{ hashFiles('cmd/build-naive/cmd_build.go', 'cmd/build-naive/cmd.go') }}-linux-${{ matrix.arch }}
+          key: naive-build-${{ steps.naive.outputs.commit }}-${{ hashFiles('cmd/build-naive/cmd_build.go', 'cmd/build-naive/cmd.go', '.github/workflows/naive-build.yml') }}-linux-${{ matrix.arch }}
       - name: Cache ccache files
         if: steps.build-cache.outputs.cache-hit != 'true'
         uses: actions/cache@v4
