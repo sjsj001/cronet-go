@@ -49,12 +49,20 @@ jobs:
             naiveproxy/src/chrome/build/pgo_profiles
             naiveproxy/src/out/sysroot-build
           key: toolchain-linux-${{ matrix.arch }}-${{ steps.chromium.outputs.version }}-${{ hashFiles('naiveproxy/src/get-clang.sh', 'naiveproxy/src/get-sysroot.sh', 'naiveproxy/src/get-openwrt.sh', 'naiveproxy/src/DEPS', 'naiveproxy/src/tools/clang/scripts/update.py', 'naiveproxy/src/build/linux/sysroot_scripts/sysroot_creator.py', 'naiveproxy/src/build/linux/sysroot_scripts/reversion_glibc.py', 'naiveproxy/src/build/linux/sysroot_scripts/generated_package_lists/**', 'cmd/build-naive/cmd_build.go', 'cmd/build-naive/cmd.go') }}
+      - name: Patch naiveproxy and SPDY limits
+        run: |
+          set -e
+          FILE="naiveproxy/src/net/socket/tcp_socket_posix.cc"
+          sed -i '/PLOG(ERROR) << "Failed to set TCP_KEEPIDLE on fd: "/d' "$FILE"
+
+          echo "Patched TCP_KEEPIDLE log:"
+          grep -n "TCP_KEEPIDLE" "$FILE"
       - name: Cache build artifacts
         id: build-cache
         uses: actions/cache@v4
         with:
           path: naiveproxy/src/out
-          key: naive-build-${{ steps.naive.outputs.commit }}-${{ hashFiles('cmd/build-naive/cmd_build.go', 'cmd/build-naive/cmd.go') }}-linux-${{ matrix.arch }}
+          key: naive-build-${{ steps.naive.outputs.commit }}-${{ hashFiles('cmd/build-naive/cmd_build.go', 'cmd/build-naive/cmd.go', '.github/workflows/naive-build.yml') }}-linux-${{ matrix.arch }}
       - name: Cache ccache files
         if: steps.build-cache.outputs.cache-hit != 'true'
         uses: actions/cache@v4
