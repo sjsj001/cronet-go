@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/sagernet/cronet-go/pool"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -67,7 +68,8 @@ type NaiveClient struct {
 	quicEnabled              bool
 	quicCongestionControl    QUICCongestionControl
 	quicSessionReceiveWindow uint64
-	counter                  atomic.Uint64
+	adaptive                 bool
+	pools                    *pool.Allocator
 	started                  chan struct{}
 	singleEngine             bool
 	engines                  []Engine
@@ -128,9 +130,21 @@ func NewNaiveClient(config NaiveClientOptions) (*NaiveClient, error) {
 			[]byte(config.Username+":"+config.Password))
 	}
 
+	// No explicit concurrency means adaptive pools: grow on demand, shrink
+	// when demand goes, capped by what this host's memory can buffer. An
+	// explicit value keeps the fixed pool count it always meant — the escape
+	// hatch every current deployment runs on. QUIC never pools (its streams
+	// multiplex one connection natively), so it stays a fixed single.
+	adaptive := config.InsecureConcurrency == 0 && !config.QUIC
 	concurrency := config.InsecureConcurrency
 	if concurrency < 1 {
 		concurrency = 1
+	}
+	var pools *pool.Allocator
+	if adaptive {
+		pools = pool.NewAdaptive(pool.Cap(pool.TotalMemory(), effectiveH2ReceiveWindow(config.ReceiveWindow)))
+	} else {
+		pools = pool.NewFixed(concurrency)
 	}
 
 	ctx := config.Context
@@ -169,8 +183,33 @@ func NewNaiveClient(config NaiveClientOptions) (*NaiveClient, error) {
 		quicCongestionControl:    config.QUICCongestionControl,
 		receiveWindow:            config.ReceiveWindow,
 		quicSessionReceiveWindow: config.QUICSessionReceiveWindow,
+		adaptive:                 adaptive,
+		pools:                    pools,
 		started:                  make(chan struct{}),
 	}, nil
+}
+
+// effectiveH2ReceiveWindow resolves the configured session window to what the
+// engine will actually announce, defaults included — the pool cap must be
+// derived from the real window, not from a zero that means "default".
+func effectiveH2ReceiveWindow(configured uint64) uint64 {
+	if configured != 0 {
+		return configured
+	}
+	if runtime.GOOS == "ios" {
+		return 4 * 1024 * 1024
+	}
+	return 128 * 1024 * 1024
+}
+
+// Pools reports how many isolated connections streams are currently spread
+// over: the live pool count when adaptive, the fixed setting otherwise. A
+// warmup pass uses it to leave none of them cold.
+func (c *NaiveClient) Pools() int {
+	if c.adaptive {
+		return c.pools.InUse()
+	}
+	return c.concurrency
 }
 
 func (c *NaiveClient) Start() error {
@@ -399,14 +438,7 @@ func (c *NaiveClient) startEngine(tcpDialer Dialer, udpDialer UDPDialer, dnsServ
 			}
 			paramsError = params.SetQUICOptions("", string(c.quicCongestionControl), streamReceiveWindow, sessionReceiveWindow)
 		} else {
-			receiveWindow := c.receiveWindow
-			if receiveWindow == 0 {
-				if runtime.GOOS == "ios" {
-					receiveWindow = 4 * 1024 * 1024
-				} else {
-					receiveWindow = 128 * 1024 * 1024
-				}
-			}
+			receiveWindow := effectiveH2ReceiveWindow(c.receiveWindow)
 			paramsError = params.SetHTTP2Options(receiveWindow, receiveWindow/2)
 		}
 	}
@@ -474,27 +506,55 @@ func (c *NaiveClient) DialEarly(ctx context.Context, destination M.Socksaddr) (N
 		headers[key] = value
 	}
 
-	streamEngine := c.streamEngines[0]
-	if c.concurrency > 1 {
-		concurrencyIndex := int(c.counter.Add(1) % uint64(c.concurrency))
-		if len(c.streamEngines) > 1 {
-			streamEngine = c.streamEngines[concurrencyIndex]
-		} else {
-			headers["-network-isolation-key"] = F.ToString("https://pool-", concurrencyIndex, ":443")
+	stream := c.pools.Allocate(destination.String())
+	conn, err := c.startStream(ctx, headers, stream)
+	if err != nil {
+		stream.Release()
+		// A synchronous Start failure means nothing reached the wire, so one
+		// clean retry costs nothing. (The idled-out-session race surfaces
+		// asynchronously and is DialContext's retry to make.)
+		stream = c.pools.Allocate(destination.String())
+		conn, err = c.startStream(ctx, headers, stream)
+		if err != nil {
+			stream.Release()
+			return nil, err
 		}
 	}
-	conn := streamEngine.CreateConn(ctx, c.logger, true, false)
-	err := conn.Start("CONNECT", c.serverURL, headers, 0, false)
-	if err != nil {
-		return nil, err
-	}
 	trackedConn := &trackedNaiveConn{
-		NaiveConn: NewNaiveConn(ctx, conn, c.logger),
-		client:    c,
+		NaiveConn:  NewNaiveConn(ctx, conn, c.logger),
+		client:     c,
+		poolStream: stream,
 	}
 	c.activeConnections.Add(1)
 	conn.setOnTerminate(trackedConn.release)
 	return trackedConn, nil
+}
+
+func (c *NaiveClient) startStream(ctx context.Context, headers map[string]string, stream *pool.Stream) (*BidirectionalConn, error) {
+	streamEngine := c.streamEngines[0]
+	if c.adaptive || c.concurrency > 1 {
+		if len(c.streamEngines) > 1 {
+			// One engine per pool: the engine set is only ever built in fixed
+			// mode, where the pool ceiling is the engine count, so the pool
+			// index is the engine index. Separate engines already separate the
+			// sessions — keying on top would split each engine again.
+			streamEngine = c.streamEngines[stream.Pool()]
+		} else {
+			// Under adaptive every stream is keyed, pool 0 included: an unkeyed
+			// session and a pool-0 session are distinct Chromium session keys and
+			// would coexist as two connections. cronet consumes the header before
+			// anything reaches the wire, and requires it to parse as a URL — an
+			// opaque site is a process-level CHECK.
+			headers["-network-isolation-key"] = F.ToString("https://pool-", stream.Pool(), ":443")
+		}
+	}
+	conn := streamEngine.CreateConn(ctx, c.logger, true, false)
+	conn.setOnTraffic(stream.Note)
+	err := conn.Start("CONNECT", c.serverURL, headers, 0, false)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
 func (c *NaiveClient) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -502,6 +562,24 @@ func (c *NaiveClient) DialContext(ctx context.Context, network string, destinati
 		return nil, os.ErrInvalid
 	}
 	conn, err := c.DialEarly(ctx, destination)
+	if err != nil {
+		return nil, err
+	}
+	err = conn.HandshakeContext(ctx)
+	if err == nil {
+		return conn, nil
+	}
+	conn.Close()
+	var handshakeErr *HandshakeError
+	if errors.As(err, &handshakeErr) || ctx.Err() != nil {
+		// The proxy answered — that verdict is deterministic, retrying it is
+		// hammering. Only transport deaths below get a second dial.
+		return nil, err
+	}
+	// The connection never left this function and carried no payload, so a
+	// transport failure — a session the server idled out mid-dial included —
+	// is free to retry once on a fresh stream.
+	conn, err = c.DialEarly(ctx, destination)
 	if err != nil {
 		return nil, err
 	}
@@ -577,12 +655,14 @@ func (c *NaiveClient) getECHConfigList() []byte {
 
 type trackedNaiveConn struct {
 	NaiveConn
-	client    *NaiveClient
-	closeOnce sync.Once
+	client     *NaiveClient
+	poolStream *pool.Stream
+	closeOnce  sync.Once
 }
 
 func (c *trackedNaiveConn) release() {
 	c.closeOnce.Do(func() {
+		c.poolStream.Release()
 		c.client.activeConnections.Done()
 	})
 }

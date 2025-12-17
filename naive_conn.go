@@ -3,14 +3,15 @@ package cronet
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"math/rand"
 	"net"
+	"strconv"
 
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/baderror"
 	"github.com/sagernet/sing/common/buf"
-	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/common/rw"
 )
@@ -182,7 +183,33 @@ type NaiveConn interface {
 	net.Conn
 	Handshake() error
 	HandshakeContext(ctx context.Context) error
+	// WaitReady blocks until the connection to the proxy is established, without
+	// waiting for the proxy to answer.
+	WaitReady(ctx context.Context) error
+	// CarriedPayload reports whether any payload byte has been handed to the
+	// stream. It is what lets a caller prove a failed connection never carried
+	// its request, which is the precondition for replaying that request
+	// elsewhere. The answer is final once Close has returned.
+	CarriedPayload() bool
+	// Timing reports the stream's setup/round-trip breakdown, available once the
+	// handshake has completed.
+	Timing() (ConnTiming, bool)
+	// ResponseHeader returns a header from the proxy's response, available once
+	// the handshake has completed.
+	ResponseHeader(key string) (string, bool)
 }
+
+// HandshakeError reports a proxy response whose status was not 200. Callers use
+// StatusCode to tell apart failures the proxy attributes to the destination from
+// failures it attributes to its own upstream.
+type HandshakeError struct {
+	StatusCode int
+}
+
+func (e *HandshakeError) Error() string {
+	return "unexpected response status: " + strconv.Itoa(e.StatusCode)
+}
+
 type naiveConn struct {
 	net.Conn
 	ctx    context.Context
@@ -198,11 +225,43 @@ func NewNaiveConn(ctx context.Context, conn *BidirectionalConn, l logger.Context
 func (c *naiveConn) Handshake() error {
 	headers, err := c.conn.WaitForHeaders()
 	if err != nil {
-		c.logger.WarnContext(c.ctx, "handshake failed: ", err)
+		return c.handshakeFailed(err)
+	}
+	return c.checkStatus(headers)
+}
+
+func (c *naiveConn) HandshakeContext(ctx context.Context) error {
+	headers, err := c.conn.WaitForHeadersContext(ctx)
+	if err != nil {
+		return c.handshakeFailed(err)
+	}
+	return c.checkStatus(headers)
+}
+
+// handshakeFailed reports a CONNECT that produced no answer, at the level its
+// cause deserves.
+//
+// A stream this end closed, or a caller that stopped waiting for one, is not a
+// failure of anything: it is a client dropping a connection it opened
+// speculatively, and on a preconnect host that is the ordinary case rather than
+// the exception — measured on one deployment at 51 of 63 dials to a CDN name,
+// against 1 of 1303 to a name actually in use. Reported as warnings they bury
+// the answers that are real, and each one arrives twice, because every dial is
+// measured twice: once by whoever is ranking the path, once by the detached
+// line that records it.
+func (c *naiveConn) handshakeFailed(err error) error {
+	if errors.Is(err, ErrClosedLocally) || errors.Is(err, context.Canceled) {
+		c.logger.DebugContext(c.ctx, "handshake abandoned: ", err)
 		return err
 	}
+	c.logger.WarnContext(c.ctx, "handshake failed: ", err)
+	return err
+}
+
+func (c *naiveConn) checkStatus(headers map[string]string) error {
 	if headers[":status"] != "200" {
-		err = E.New("unexpected response status: ", headers[":status"])
+		statusCode, _ := strconv.Atoi(headers[":status"])
+		err := error(&HandshakeError{StatusCode: statusCode})
 		c.logger.WarnContext(c.ctx, "handshake failed: ", err)
 		return err
 	}
@@ -210,19 +269,26 @@ func (c *naiveConn) Handshake() error {
 	return nil
 }
 
-func (c *naiveConn) HandshakeContext(ctx context.Context) error {
-	headers, err := c.conn.WaitForHeadersContext(ctx)
-	if err != nil {
-		c.logger.WarnContext(c.ctx, "handshake failed: ", err)
-		return err
+func (c *naiveConn) WaitReady(ctx context.Context) error {
+	return c.conn.WaitReady(ctx)
+}
+
+func (c *naiveConn) CarriedPayload() bool {
+	return c.conn.CarriedPayload()
+}
+
+func (c *naiveConn) Timing() (ConnTiming, bool) {
+	return c.conn.Timing()
+}
+
+func (c *naiveConn) ResponseHeader(key string) (string, bool) {
+	select {
+	case <-c.conn.handshake:
+	default:
+		return "", false
 	}
-	if headers[":status"] != "200" {
-		err = E.New("unexpected response status: ", headers[":status"])
-		c.logger.WarnContext(c.ctx, "handshake failed: ", err)
-		return err
-	}
-	c.logger.DebugContext(c.ctx, "handshake succeeded")
-	return nil
+	value, loaded := c.conn.headers[key]
+	return value, loaded
 }
 
 func (c *naiveConn) Read(p []byte) (n int, err error) {

@@ -692,20 +692,34 @@ func TestNaiveInsecureConcurrencySessionCount(t *testing.T) {
 	// Start NetLog
 	netLogPath := startNetLogForTest(t, client, "insecure_concurrency_netlog.json", true)
 
-	// Send multiple sequential connections to trigger round-robin
+	// Six concurrent tunnels, held open together: balanced placement spreads
+	// them two per pool. (Sequential dials would all land on the least busy
+	// pool — pool 0 every time — which is the point of balancing; concurrency
+	// is what opens the pools.)
+	var wg sync.WaitGroup
+	conns := make([]net.Conn, connectionCount)
 	for i := 0; i < connectionCount; i++ {
-		conn, err := client.DialEarly(context.Background(), M.ParseSocksaddrHostPort("127.0.0.1", uint16(18000+i)))
-		require.NoError(t, err)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			conn, err := client.DialEarly(context.Background(), M.ParseSocksaddrHostPort("127.0.0.1", uint16(18000+i)))
+			require.NoError(t, err)
+			conns[i] = conn
 
-		testData := []byte("test")
-		_, err = conn.Write(testData)
-		require.NoError(t, err)
+			testData := []byte("test")
+			_, err = conn.Write(testData)
+			require.NoError(t, err)
 
-		buf := make([]byte, len(testData))
-		_, err = io.ReadFull(conn, buf)
-		require.NoError(t, err)
-
-		conn.Close()
+			buf := make([]byte, len(testData))
+			_, err = io.ReadFull(conn, buf)
+			require.NoError(t, err)
+		}(i)
+	}
+	wg.Wait()
+	for _, conn := range conns {
+		if conn != nil {
+			conn.Close()
+		}
 	}
 
 	// Stop NetLog and read results
