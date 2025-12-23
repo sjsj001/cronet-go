@@ -80,7 +80,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: naiveproxy/src/out
-          key: naive-build-${{ steps.naive.outputs.commit }}-${{ hashFiles('cmd/build-naive/cmd_build.go', 'cmd/build-naive/cmd.go') }}-linux-${{ matrix.arch }}
+          key: naive-build-${{ steps.naive.outputs.commit }}-${{ hashFiles('cmd/build-naive/cmd_build.go', 'cmd/build-naive/cmd.go', '.github/workflows/naive-build.yml') }}-linux-${{ matrix.arch }}
       - name: Cache ccache files
         if: steps.build-cache.outputs.cache-hit != 'true'
         uses: actions/cache@v4
