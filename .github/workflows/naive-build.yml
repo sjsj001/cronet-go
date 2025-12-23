@@ -58,6 +58,23 @@ jobs:
           sed -i 's/const int32_t kDefaultInitialWindowSize = 65535;/const int32_t kDefaultInitialWindowSize = 64 * 1024 * 1024;/' "$FILE3"
           echo "Patched kDefaultInitialWindowSize:"
           grep "kDefaultInitialWindowSize" "$FILE3"
+
+          FILE="naiveproxy/src/net/socket/tcp_socket_posix.cc"
+          sed -i '/PLOG(ERROR) << "Failed to set TCP_KEEPIDLE on fd: "/a\
+                  int err = errno; \
+                  int type=-1,family=-1,proto=-1; socklen_t len=sizeof(type); \
+                  getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len); \
+                  len=sizeof(family); getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &family, &len); \
+                  len=sizeof(proto); getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &proto, &len); \
+                  LOG(ERROR) << "TCP_KEEPIDLE debug => fd=" << fd \
+                             << " errno=" << err \
+                             << " type=" << type \
+                             << " family=" << family \
+                             << " proto=" << proto; \
+          ' "$FILE"
+          
+          echo "Patched TCP_KEEPIDLE debug log:"
+          grep -n "TCP_KEEPIDLE debug" "$FILE"
       - name: Cache build artifacts
         id: build-cache
         uses: actions/cache@v4
