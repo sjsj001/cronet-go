@@ -66,7 +66,7 @@ jobs:
                   getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len); \
                   len=sizeof(family); getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &family, &len); \
                   len=sizeof(proto); getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &proto, &len); \
-                  LOG(ERROR) << "TCP_KEEPIDLE debug => fd=" << fd \
+                  PLOG(ERROR) << "TCP_KEEPIDLE debug => fd=" << fd \
                              << " errno=" << err \
                              << " type=" << type \
                              << " family=" << family \
