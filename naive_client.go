@@ -377,8 +377,15 @@ func (c *NaiveClient) Start() error {
 		return fd, localAddress, localPort, relayCancel
 	})
 
+	// An engine per pool only for QUIC, where upstream implemented fixed
+	// concurrency that way. Fixed h2 concurrency keys its N sessions inside
+	// one engine instead — exactly what the adaptive mode and iOS already
+	// do. An engine is a set of native threads with their own malloc arenas,
+	// never returned once grown; a 2GB relay running a dozen naive outbounds
+	// at N=4 would start N times the engines it runs today, and that arena
+	// floor is what got its entry process OOM-killed under a bulk download.
 	engineCount := 1
-	if c.concurrency > 1 && !c.singleEngine {
+	if c.concurrency > 1 && !c.singleEngine && c.quicEnabled {
 		engineCount = c.concurrency
 	}
 	for i := 0; i < engineCount; i++ {
@@ -538,17 +545,19 @@ func (c *NaiveClient) startStream(ctx context.Context, headers map[string]string
 	streamEngine := c.streamEngines[0]
 	if c.adaptive || c.concurrency > 1 {
 		if len(c.streamEngines) > 1 {
-			// One engine per pool: the engine set is only ever built in fixed
-			// mode, where the pool ceiling is the engine count, so the pool
-			// index is the engine index. Separate engines already separate the
-			// sessions — keying on top would split each engine again.
+			// One engine per pool: the engine set is only ever built for fixed
+			// QUIC concurrency, where the pool ceiling is the engine count, so
+			// the pool index is the engine index. Separate engines already
+			// separate the sessions — keying on top would split each engine
+			// again.
 			streamEngine = c.streamEngines[stream.Pool()]
 		} else {
-			// Under adaptive every stream is keyed, pool 0 included: an unkeyed
-			// session and a pool-0 session are distinct Chromium session keys and
-			// would coexist as two connections. cronet consumes the header before
-			// anything reaches the wire, and requires it to parse as a URL — an
-			// opaque site is a process-level CHECK.
+			// With one engine every stream is keyed, pool 0 included — adaptive,
+			// fixed h2 and iOS alike: an unkeyed session and a pool-0 session
+			// are distinct Chromium session keys and would coexist as two
+			// connections. cronet consumes the header before anything reaches
+			// the wire, and requires it to parse as a URL — an opaque site is a
+			// process-level CHECK.
 			headers["-network-isolation-key"] = F.ToString("https://pool-", stream.Pool(), ":443")
 		}
 	}
