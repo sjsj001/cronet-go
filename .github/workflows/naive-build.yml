@@ -57,6 +57,19 @@ jobs:
 
           echo "Patched TCP_KEEPIDLE log:"
           grep -n "TCP_KEEPIDLE" "$FILE"
+
+          # h2 receive-window credit. Chromium returns a WINDOW_UPDATE only once
+          # half the window has been consumed, or when 5s have passed since the
+          # last one. A bulk stream feeding a slow consumer therefore parks the
+          # whole session for seconds, and a small stream opened on it waits
+          # that long for its first DATA frame even though its HEADERS got
+          # through. 100ms bounds that wait; the half-window rule still covers
+          # fast downloads, so this only adds frames where the consumer is slow.
+          SPDY="naiveproxy/src/net/spdy/spdy_session.h"
+          sed -i '/kDefaultTimeToBufferSmallWindowUpdates =/{n;s/base::Seconds(5)/base::Milliseconds(100)/}' "$SPDY"
+          grep -n -A1 "kDefaultTimeToBufferSmallWindowUpdates =" "$SPDY" | grep -q "Milliseconds(100)" || { echo "window-update patch did not apply"; exit 1; }
+          echo "Patched small window-update buffering:"
+          grep -n -A1 "kDefaultTimeToBufferSmallWindowUpdates =" "$SPDY"
       - name: Cache build artifacts
         id: build-cache
         uses: actions/cache@v4
