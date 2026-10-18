@@ -136,6 +136,19 @@ func (c BidirectionalStream) Write(buffer []byte, endOfStream bool) int {
 	return int(C.bidirectional_stream_write((*C.bidirectional_stream)(unsafe.Pointer(c.ptr)), (*C.char)(unsafe.Pointer(&buffer[0])), C.int(len(buffer)), C.bool(endOfStream)))
 }
 
+// endOfStreamBuffer is what WriteEndOfStream points at. Its contents are never
+// read; it exists because the native write rejects a null buffer even when the
+// length is zero.
+var endOfStreamBuffer [1]byte
+
+// WriteEndOfStream sends end of stream with no data: a zero-length DATA frame
+// carrying END_STREAM on HTTP/2, a FIN on QUIC. Write cannot do this, because it
+// passes a null buffer for an empty slice and the native write refuses one.
+// Like Write, it results in an OnWriteCompleted() callback.
+func (c BidirectionalStream) WriteEndOfStream() int {
+	return int(C.bidirectional_stream_write((*C.bidirectional_stream)(unsafe.Pointer(c.ptr)), (*C.char)(unsafe.Pointer(&endOfStreamBuffer[0])), 0, C.bool(true)))
+}
+
 // Flush Flushes pending writes. This method should not be called before invocation of
 // BidirectionalStreamCallback.OnStreamReady() method.
 // For each previously called Write()

@@ -34,3 +34,10 @@ func cleanupBidirectionalStream(ptr uintptr) {
 	delete(bidirectionalStreamMap, ptr)
 	bidirectionalStreamAccess.Unlock()
 }
+
+// destroy is Destroy plus forgetting the stream's callback, which a
+// BidirectionalConn always does together when its stream ends.
+func (c BidirectionalStream) destroy() {
+	c.Destroy()
+	cleanupBidirectionalStream(c.ptr)
+}

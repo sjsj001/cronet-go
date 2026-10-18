@@ -99,6 +99,14 @@ func (s BidirectionalStream) Write(buffer []byte, endOfStream bool) int {
 	return int(cronet.BidirectionalStreamWrite(s.ptr, uintptr(unsafe.Pointer(&buffer[0])), int32(len(buffer)), endOfStream))
 }
 
+// endOfStreamBuffer is what WriteEndOfStream points at; see the cgo variant.
+var endOfStreamBuffer [1]byte
+
+// WriteEndOfStream sends end of stream with no data; see the cgo variant.
+func (s BidirectionalStream) WriteEndOfStream() int {
+	return int(cronet.BidirectionalStreamWrite(s.ptr, uintptr(unsafe.Pointer(&endOfStreamBuffer[0])), 0, true))
+}
+
 func (s BidirectionalStream) Flush() {
 	cronet.BidirectionalStreamFlush(s.ptr)
 }
