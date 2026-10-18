@@ -1,0 +1,587 @@
+From be94641305ad580315b9c77ff52bf447b22fa940 Mon Sep 17 00:00:00 2001
+From: sjsj001 <>
+Date: Sat, 17 Oct 2026 08:32:03 +0800
+Subject: [PATCH] Auto-tune HTTP/2 stream receive windows
+
+A naive client announces one stream window for every stream, sized for
+the fastest one: 64MB by default. A fast sender behind a slow consumer
+fills it, so every slow reader holds that much memory; measured on a
+two-hop chain with eight downloads read at 1MB/s, each process held
+about 645MB. A smaller fixed window costs the fast case instead: 16MB
+halved one stream over 180ms (485 to 262Mbit/s).
+
+With auto-tuning on, a session whose transport reports its RTT announces
+an initial stream window sized for 1200Mbit/s over the path's RTT, 8MB at
+the least. The path's RTT is the smaller of the session's own smoothed
+RTT and the minimum RTT its pool's other sessions to the server report:
+a session opened while the path already queues measures that queue in
+its handshake (1.8s behind a saturated 50Mbit/s link in a test), and a
+window sized on it would add to the queue. A stream doubles its window
+towards the configured size when half of it is consumed within two round
+trips of the previous such update (QUIC's rule) twice in a row, and the
+smoothed RTT is within 1.5x of the minimum. A slow reader never meets
+the first condition, so its window and the memory behind it stay at the
+initial size; twice in a row keeps a relay's stream from reading a burst
+into the next hop's window as a fast reader; a queue on the path fails
+the last, so the window does not grow with the queue it would feed. The
+8MB floor covers a local hop, whose RTT is microseconds while its
+consumer takes milliseconds.
+
+The RTT comes from TCP_INFO (Linux and Android; tcpi_min_rtt needs
+Linux 4.6), through a new StreamSocket::GetTransportRttInfo that the SSL
+socket, TCPClientSocket and the custom dialer's socket forward. A
+session over a transport that cannot report it announces the configured
+window as before. The switch is per engine: the HTTP2Options
+experimental option "stream_window_auto_tuning" sets
+HttpNetworkSessionParams::spdy_stream_recv_window_auto_tuning, which the
+session's SpdySessionPool hands to each session it initializes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../cronet/url_request_context_config.cc      |  6 ++
+ src/net/http/http_network_session.cc          |  2 +
+ src/net/http/http_network_session.h           |  3 +
+ .../socket/custom_client_socket_factory.cc    |  4 ++
+ src/net/socket/ssl_client_socket_impl.cc      |  5 ++
+ src/net/socket/ssl_client_socket_impl.h       |  2 +
+ src/net/socket/stream_socket.cc               |  5 ++
+ src/net/socket/stream_socket.h                |  9 +++
+ src/net/socket/tcp_client_socket.cc           |  9 +++
+ src/net/socket/tcp_client_socket.h            |  2 +
+ src/net/socket/tcp_socket_posix.cc            | 48 +++++++++++++++
+ src/net/socket/tcp_socket_posix.h             |  6 ++
+ src/net/spdy/spdy_session.cc                  | 47 ++++++++++++++
+ src/net/spdy/spdy_session.h                   | 27 ++++++++
+ src/net/spdy/spdy_session_pool.cc             | 16 +++++
+ src/net/spdy/spdy_session_pool.h              | 15 +++++
+ src/net/spdy/spdy_stream.cc                   | 61 ++++++++++++++++++-
+ src/net/spdy/spdy_stream.h                    | 12 ++++
+ 18 files changed, 277 insertions(+), 2 deletions(-)
+
+diff --git a/src/components/cronet/url_request_context_config.cc b/src/components/cronet/url_request_context_config.cc
+index a6170c671..2195262eb 100644
+--- a/src/components/cronet/url_request_context_config.cc
++++ b/src/components/cronet/url_request_context_config.cc
+@@ -866,6 +866,12 @@ void URLRequestContextConfig::SetContextBuilderExperimentalOptions(
+             ->http2_settings[spdy::SETTINGS_INITIAL_WINDOW_SIZE] =
+             static_cast<uint32_t>(*initial_window_size);
+       }
++      std::optional<bool> stream_window_auto_tuning =
++          args.FindBool("stream_window_auto_tuning");
++      if (stream_window_auto_tuning.has_value()) {
++        session_params->spdy_stream_recv_window_auto_tuning =
++            *stream_window_auto_tuning;
++      }
+     } else if (iter->first == kSocketPoolOptions) {
+       if (!iter->second.is_dict()) {
+         LOG(ERROR) << "\"" << iter->first << "\" config params \""
+diff --git a/src/net/http/http_network_session.cc b/src/net/http/http_network_session.cc
+index 0ccbec3fc..f5f743157 100644
+--- a/src/net/http/http_network_session.cc
++++ b/src/net/http/http_network_session.cc
+@@ -192,6 +192,8 @@ HttpNetworkSession::HttpNetworkSession(const HttpNetworkSessionParams& params,
+   DCHECK(ssl_config_service_);
+   CHECK(http_server_properties_);
+   DCHECK(context_.client_socket_factory);
++  spdy_session_pool_.set_stream_recv_window_auto_tuning(
++      params.spdy_stream_recv_window_auto_tuning);
+ 
+   normal_socket_pool_manager_ = std::make_unique<ClientSocketPoolManagerImpl>(
+       CreateCommonConnectJobParams(false /* for_websockets */),
+diff --git a/src/net/http/http_network_session.h b/src/net/http/http_network_session.h
+index 0097a398b..93e1bbd9b 100644
+--- a/src/net/http/http_network_session.h
++++ b/src/net/http/http_network_session.h
+@@ -88,6 +88,9 @@ struct NET_EXPORT HttpNetworkSessionParams {
+   bool enable_spdy_ping_based_connection_checking = true;
+   bool enable_http2 = true;
+   size_t spdy_session_max_recv_window_size;
++  // Auto-tune HTTP/2 stream receive windows, with the configured stream window
++  // as the most a stream grows to; see SpdySession::stream_recv_window_cap.
++  bool spdy_stream_recv_window_auto_tuning = false;
+   // Maximum number of capped frames that can be queued at any time.
+   int spdy_session_max_queued_capped_frames;
+   // Whether SPDY pools should mark sessions as going away upon relevant network
+diff --git a/src/net/socket/custom_client_socket_factory.cc b/src/net/socket/custom_client_socket_factory.cc
+index 353e893c3..b04364ef8 100644
+--- a/src/net/socket/custom_client_socket_factory.cc
++++ b/src/net/socket/custom_client_socket_factory.cc
+@@ -684,6 +684,10 @@ class DialerTransportClientSocket : public TransportClientSocket {
+   int64_t GetTotalReceivedBytes() const override {
+     return socket_ ? socket_->GetTotalReceivedBytes() : 0;
+   }
++  bool GetTransportRttInfo(base::TimeDelta* smoothed_rtt,
++                           base::TimeDelta* min_rtt) const override {
++    return socket_ && socket_->GetTransportRttInfo(smoothed_rtt, min_rtt);
++  }
+   int Read(IOBuffer* buf,
+            int buf_len,
+            CompletionOnceCallback callback) override {
+diff --git a/src/net/socket/ssl_client_socket_impl.cc b/src/net/socket/ssl_client_socket_impl.cc
+index b3d4cb912..3aeac7a9e 100644
+--- a/src/net/socket/ssl_client_socket_impl.cc
++++ b/src/net/socket/ssl_client_socket_impl.cc
+@@ -549,6 +549,11 @@ int64_t SSLClientSocketImpl::GetTotalReceivedBytes() const {
+   return stream_socket_->GetTotalReceivedBytes();
+ }
+ 
++bool SSLClientSocketImpl::GetTransportRttInfo(base::TimeDelta* smoothed_rtt,
++                                              base::TimeDelta* min_rtt) const {
++  return stream_socket_->GetTransportRttInfo(smoothed_rtt, min_rtt);
++}
++
+ void SSLClientSocketImpl::GetSSLCertRequestInfo(
+     SSLCertRequestInfo* cert_request_info) const {
+   if (!ssl_) {
+diff --git a/src/net/socket/ssl_client_socket_impl.h b/src/net/socket/ssl_client_socket_impl.h
+index ef87745a0..96cbe4a5f 100644
+--- a/src/net/socket/ssl_client_socket_impl.h
++++ b/src/net/socket/ssl_client_socket_impl.h
+@@ -97,6 +97,8 @@ class NET_EXPORT_PRIVATE SSLClientSocketImpl
+   std::optional<std::string_view> GetPeerApplicationSettings() const override;
+   bool GetSSLInfo(SSLInfo* ssl_info) override;
+   int64_t GetTotalReceivedBytes() const override;
++  bool GetTransportRttInfo(base::TimeDelta* smoothed_rtt,
++                           base::TimeDelta* min_rtt) const override;
+   void GetSSLCertRequestInfo(
+       SSLCertRequestInfo* cert_request_info) const override;
+ 
+diff --git a/src/net/socket/stream_socket.cc b/src/net/socket/stream_socket.cc
+index 087fda75d..9ac349bc3 100644
+--- a/src/net/socket/stream_socket.cc
++++ b/src/net/socket/stream_socket.cc
+@@ -29,4 +29,9 @@ int StreamSocket::ConfirmHandshake(CompletionOnceCallback callback) {
+   return OK;
+ }
+ 
++bool StreamSocket::GetTransportRttInfo(base::TimeDelta* smoothed_rtt,
++                                       base::TimeDelta* min_rtt) const {
++  return false;
++}
++
+ }  // namespace net
+diff --git a/src/net/socket/stream_socket.h b/src/net/socket/stream_socket.h
+index d1c3d4536..2551a6645 100644
+--- a/src/net/socket/stream_socket.h
++++ b/src/net/socket/stream_socket.h
+@@ -11,6 +11,7 @@
+ #include <string_view>
+ 
+ #include "base/functional/bind.h"
++#include "base/time/time.h"
+ #include "base/notreached.h"
+ #include "net/base/net_errors.h"
+ #include "net/base/net_export.h"
+@@ -137,6 +138,14 @@ class NET_EXPORT StreamSocket : public Socket {
+   // Disconnect() is called.
+   virtual int64_t GetTotalReceivedBytes() const = 0;
+ 
++  // Reports the smoothed and the minimum round-trip time the transport has
++  // measured, where the platform exposes both (TCP_INFO on Linux and
++  // Android), and false otherwise. Wrapping sockets forward to the socket they
++  // wrap. HTTP/2 reads it to grow a stream's receive window only while the
++  // window, and not a queue on the path, is what limits the stream.
++  virtual bool GetTransportRttInfo(base::TimeDelta* smoothed_rtt,
++                                   base::TimeDelta* min_rtt) const;
++
+   // Apply |tag| to this socket. If socket isn't yet connected, tag will be
+   // applied when socket is later connected. If Connect() fails or socket
+   // is closed, tag is cleared. If this socket is layered upon or wraps an
+diff --git a/src/net/socket/tcp_client_socket.cc b/src/net/socket/tcp_client_socket.cc
+index 65ea23782..853c92a06 100644
+--- a/src/net/socket/tcp_client_socket.cc
++++ b/src/net/socket/tcp_client_socket.cc
+@@ -461,6 +461,15 @@ int64_t TCPClientSocket::GetTotalReceivedBytes() const {
+   return total_received_bytes_;
+ }
+ 
++bool TCPClientSocket::GetTransportRttInfo(base::TimeDelta* smoothed_rtt,
++                                          base::TimeDelta* min_rtt) const {
++#if BUILDFLAG(IS_POSIX)
++  return socket_ && socket_->GetTransportRttInfo(smoothed_rtt, min_rtt);
++#else
++  return false;
++#endif
++}
++
+ void TCPClientSocket::ApplySocketTag(const SocketTag& tag) {
+   socket_->ApplySocketTag(tag);
+ }
+diff --git a/src/net/socket/tcp_client_socket.h b/src/net/socket/tcp_client_socket.h
+index 5af7de6fc..0ff0401b3 100644
+--- a/src/net/socket/tcp_client_socket.h
++++ b/src/net/socket/tcp_client_socket.h
+@@ -107,6 +107,8 @@ class NET_EXPORT TCPClientSocket : public TransportClientSocket,
+   NextProto GetNegotiatedProtocol() const override;
+   bool GetSSLInfo(SSLInfo* ssl_info) override;
+   int64_t GetTotalReceivedBytes() const override;
++  bool GetTransportRttInfo(base::TimeDelta* smoothed_rtt,
++                           base::TimeDelta* min_rtt) const override;
+   void ApplySocketTag(const SocketTag& tag) override;
+ 
+   // Socket implementation.
+diff --git a/src/net/socket/tcp_socket_posix.cc b/src/net/socket/tcp_socket_posix.cc
+index e03e1164f..66b788ec8 100644
+--- a/src/net/socket/tcp_socket_posix.cc
++++ b/src/net/socket/tcp_socket_posix.cc
+@@ -770,6 +770,54 @@ void TCPSocketPosix::NotifySocketPerformanceWatcher() {
+ #endif  // defined(TCP_INFO)
+ }
+ 
++#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)
++namespace {
++// The kernel's struct tcp_info up to tcpi_min_rtt. The libc headers in the
++// sysroots stop short of it, and the kernel's layout only ever grows at the
++// end, so the prefix is declared here.
++struct KernelTcpInfoPrefix {
++  uint8_t state, ca_state, retransmits, probes, backoff, options, wscale,
++      flags;
++  uint32_t rto, ato, snd_mss, rcv_mss, unacked, sacked, lost, retrans, fackets;
++  uint32_t last_data_sent, last_ack_sent, last_data_recv, last_ack_recv;
++  uint32_t pmtu, rcv_ssthresh, rtt, rttvar, snd_ssthresh, snd_cwnd, advmss,
++      reordering;
++  uint32_t rcv_rtt, rcv_space, total_retrans;
++  uint64_t pacing_rate, max_pacing_rate, bytes_acked, bytes_received;
++  uint32_t segs_out, segs_in, notsent_bytes, min_rtt;
++};
++static_assert(offsetof(KernelTcpInfoPrefix, min_rtt) == 148,
++              "struct tcp_info layout");
++}  // namespace
++#endif
++
++bool TCPSocketPosix::GetTransportRttInfo(base::TimeDelta* smoothed_rtt,
++                                         base::TimeDelta* min_rtt) const {
++#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)
++  if (!socket_) {
++    return false;
++  }
++  KernelTcpInfoPrefix info = {};
++  socklen_t info_len = sizeof(info);
++  if (getsockopt(socket_->socket_fd(), IPPROTO_TCP, TCP_INFO, &info,
++                 &info_len) != 0 ||
++      info_len < sizeof(info)) {
++    return false;
++  }
++  // tcpi_min_rtt is ~0U until the first RTT sample, and the kernel never
++  // records a sample of 0. tcpi_rtt rounds down to whole microseconds and can
++  // read 0 on loopback; as in GetTransportRtt, that is a microsecond.
++  if (info.min_rtt == 0 || info.min_rtt == ~0U) {
++    return false;
++  }
++  *smoothed_rtt = base::Microseconds(std::max<uint32_t>(info.rtt, 1));
++  *min_rtt = base::Microseconds(info.min_rtt);
++  return true;
++#else
++  return false;
++#endif
++}
++
+ bool TCPSocketPosix::GetEstimatedRoundTripTime(base::TimeDelta* out_rtt) const {
+   DCHECK(out_rtt);
+   if (!socket_)
+diff --git a/src/net/socket/tcp_socket_posix.h b/src/net/socket/tcp_socket_posix.h
+index ba05267a8..519ed7a3f 100644
+--- a/src/net/socket/tcp_socket_posix.h
++++ b/src/net/socket/tcp_socket_posix.h
+@@ -131,6 +131,12 @@ class NET_EXPORT TCPSocketPosix {
+   // unavailable. May also return false when estimated RTT is 0.
+   [[nodiscard]] bool GetEstimatedRoundTripTime(base::TimeDelta* out_rtt) const;
+ 
++  // The smoothed and the minimum RTT from TCP_INFO, on Linux and Android
++  // (tcpi_min_rtt needs Linux 4.6). False elsewhere, or when either is not
++  // known yet.
++  [[nodiscard]] bool GetTransportRttInfo(base::TimeDelta* smoothed_rtt,
++                                         base::TimeDelta* min_rtt) const;
++
+   // Closes the socket.
+   void Close();
+ 
+diff --git a/src/net/spdy/spdy_session.cc b/src/net/spdy/spdy_session.cc
+index 1788d665c..2ec5252f2 100644
+--- a/src/net/spdy/spdy_session.cc
++++ b/src/net/spdy/spdy_session.cc
+@@ -1664,6 +1664,10 @@ void SpdySession::InitializeInternal(SpdySessionPool* pool) {
+   });
+ 
+   DCHECK_EQ(availability_state_, STATE_AVAILABLE);
++  if (pool && pool->stream_recv_window_auto_tuning()) {
++    stream_recv_window_auto_tuning_ = true;
++    pool_min_rtt_ = pool->MinTransportRttTo(host_port_pair());
++  }
+   if (enable_sending_initial_data_)
+     SendInitialData();
+   pool_ = pool;
+@@ -2274,6 +2278,23 @@ void SpdySession::NotifyRequestsOfConfirmation(int rv) {
+   in_confirm_handshake_ = false;
+ }
+ 
++namespace {
++// The window a stream starts with when auto-tuning is what a stream needs to
++// run at kAutoTunedInitialRate over this session's RTT, never less than
++// kAutoTunedInitialStreamWindowFloor: a stream on a fresh session must reach a
++// gigabit at once, with a fifth to spare (1200Mbit/s), rather than ramp up
++// to it. The floor covers what the transport's RTT does not see — a local
++// hop whose consumer takes milliseconds to read, where the RTT is tens of
++// microseconds and the growth rule never fires.
++constexpr int64_t kAutoTunedInitialRate = 1200 * 1000 * 1000 / 8;  // bytes/s
++constexpr int32_t kAutoTunedInitialStreamWindowFloor = 8 * 1024 * 1024;
++}  // namespace
++
++bool SpdySession::GetTransportRttInfo(base::TimeDelta* smoothed_rtt,
++                                      base::TimeDelta* min_rtt) const {
++  return socket_ && socket_->GetTransportRttInfo(smoothed_rtt, min_rtt);
++}
++
+ void SpdySession::SendInitialData() {
+   DCHECK(enable_sending_initial_data_);
+   DCHECK(buffered_spdy_framer_.get());
+@@ -2286,6 +2307,32 @@ void SpdySession::SendInitialData() {
+       settings_map.insert(setting);
+     }
+   }
++  // Auto-tuning starts every stream small and grows it on measurement, so it
++  // needs a transport that can measure: over one that cannot report its RTT
++  // (a socket pair, a platform without TCP_INFO), a stream would stay at the
++  // initial window for good, and the configured one is announced as before.
++  // A session opened while the path already queues measures that queue in
++  // its handshake (seconds behind a saturated slow link), and a window sized
++  // on it would add to the queue; the other sessions to this server carry
++  // the path's minimum over the kernel's window (tcp_min_rtt_wlen, 300s), so
++  // the smaller of the two is the path. With no other session, a cold start
++  // behind a queue still sizes on what it measured.
++  base::TimeDelta smoothed_rtt, min_rtt;
++  if (stream_recv_window_auto_tuning_ &&
++      GetTransportRttInfo(&smoothed_rtt, &min_rtt)) {
++    const base::TimeDelta path_rtt =
++        pool_min_rtt_.is_positive() ? std::min(smoothed_rtt, pool_min_rtt_)
++                                    : smoothed_rtt;
++    const int64_t initial = std::max<int64_t>(
++        kAutoTunedInitialStreamWindowFloor,
++        kAutoTunedInitialRate * path_rtt.InMicroseconds() / 1000000);
++    if (initial < stream_max_recv_window_size_) {
++      stream_recv_window_cap_ = stream_max_recv_window_size_;
++      stream_max_recv_window_size_ = static_cast<int32_t>(initial);
++      settings_map[spdy::SETTINGS_INITIAL_WINDOW_SIZE] =
++          stream_max_recv_window_size_;
++    }
++  }
+   if (enable_http2_settings_grease_) {
+     spdy::SpdySettingsId greased_id = 0x0a0a +
+                                       0x1000 * base::RandGenerator(0xf + 1) +
+diff --git a/src/net/spdy/spdy_session.h b/src/net/spdy/spdy_session.h
+index 9c7be0f42..ce606a38b 100644
+--- a/src/net/spdy/spdy_session.h
++++ b/src/net/spdy/spdy_session.h
+@@ -523,6 +523,23 @@ class NET_EXPORT SpdySession
+     return time_to_buffer_small_window_updates_;
+   }
+ 
++  // The size streams may grow their receive window to, or zero when this
++  // session does not auto-tune. A session auto-tunes when its pool says so
++  // (HttpNetworkSessionParams::spdy_stream_recv_window_auto_tuning) and its
++  // transport reports its RTT: it announces an initial stream window sized
++  // for 1200Mbit/s over the path's RTT (8MB at least) instead of the
++  // configured one, and each stream grows its window towards the configured
++  // size only while it is window-limited on a path without a queue; see
++  // SpdyStream::MaybeGrowRecvWindow. A window sized for the fastest case is
++  // memory held for every slow reader: 64MB per stream, filled by a fast
++  // sender behind a slow consumer.
++  int32_t stream_recv_window_cap() const { return stream_recv_window_cap_; }
++
++  // The transport's smoothed and minimum RTT; see
++  // StreamSocket::GetTransportRttInfo.
++  bool GetTransportRttInfo(base::TimeDelta* smoothed_rtt,
++                           base::TimeDelta* min_rtt) const;
++
+   // Accessors for the session's availability state.
+   bool IsAvailable() const { return availability_state_ == STATE_AVAILABLE; }
+   bool IsGoingAway() const { return availability_state_ == STATE_GOING_AWAY; }
+@@ -1283,6 +1300,16 @@ class NET_EXPORT SpdySession
+   // window size.
+   int32_t stream_max_recv_window_size_;
+ 
++  // Whether the pool asked for auto-tuning, and the smallest minimum RTT its
++  // other sessions to this server report (zero for none); read by
++  // SendInitialData.
++  bool stream_recv_window_auto_tuning_ = false;
++  base::TimeDelta pool_min_rtt_;
++
++  // The configured stream receive window when auto-tuning shrank the initial
++  // one, zero otherwise; see stream_recv_window_cap.
++  int32_t stream_recv_window_cap_ = 0;
++
+   // A queue of stream IDs that have been send-stalled at some point
+   // in the past.
+   std::array<base::circular_deque<spdy::SpdyStreamId>, NUM_PRIORITIES>
+diff --git a/src/net/spdy/spdy_session_pool.cc b/src/net/spdy/spdy_session_pool.cc
+index 94189c50f..6725c31bc 100644
+--- a/src/net/spdy/spdy_session_pool.cc
++++ b/src/net/spdy/spdy_session_pool.cc
+@@ -672,6 +672,22 @@ std::unique_ptr<SpdySession> SpdySessionPool::CreateSession(
+       spdy_session_initiator);
+ }
+ 
++base::TimeDelta SpdySessionPool::MinTransportRttTo(
++    const HostPortPair& server) const {
++  base::TimeDelta result;
++  for (SpdySession* session : sessions_) {
++    base::TimeDelta smoothed_rtt, min_rtt;
++    if (session->host_port_pair() != server ||
++        !session->GetTransportRttInfo(&smoothed_rtt, &min_rtt)) {
++      continue;
++    }
++    if (result.is_zero() || min_rtt < result) {
++      result = min_rtt;
++    }
++  }
++  return result;
++}
++
+ base::expected<base::WeakPtr<SpdySession>, int> SpdySessionPool::InsertSession(
+     const SpdySessionKey& key,
+     std::unique_ptr<SpdySession> new_session,
+diff --git a/src/net/spdy/spdy_session_pool.h b/src/net/spdy/spdy_session_pool.h
+index 842c8b063..464fe7438 100644
+--- a/src/net/spdy/spdy_session_pool.h
++++ b/src/net/spdy/spdy_session_pool.h
+@@ -365,6 +365,19 @@ class NET_EXPORT SpdySessionPool
+     network_quality_estimator_ = network_quality_estimator;
+   }
+ 
++  // Whether this pool's sessions auto-tune their stream receive windows; see
++  // SpdySession::stream_recv_window_cap.
++  void set_stream_recv_window_auto_tuning(bool enabled) {
++    stream_recv_window_auto_tuning_ = enabled;
++  }
++  bool stream_recv_window_auto_tuning() const {
++    return stream_recv_window_auto_tuning_;
++  }
++
++  // The smallest transport minimum RTT among this pool's sessions to
++  // |server|, or zero when none reports one.
++  base::TimeDelta MinTransportRttTo(const HostPortPair& server) const;
++
+   // Returns the stored DNS aliases for the session key.
+   std::set<std::string> GetDnsAliasesForSessionKey(
+       const SpdySessionKey& key) const;
+@@ -537,6 +550,8 @@ class NET_EXPORT SpdySessionPool
+ 
+   size_t session_max_recv_window_size_;
+ 
++  bool stream_recv_window_auto_tuning_ = false;
++
+   // Maximum number of capped frames that can be queued at any time.
+   int session_max_queued_capped_frames_;
+ 
+diff --git a/src/net/spdy/spdy_stream.cc b/src/net/spdy/spdy_stream.cc
+index 3bb6541e3..781aec0e6 100644
+--- a/src/net/spdy/spdy_stream.cc
++++ b/src/net/spdy/spdy_stream.cc
+@@ -280,8 +280,12 @@ void SpdyStream::IncreaseRecvWindowSize(int32_t delta_window_size) {
+ #else
+   constexpr int kWindowUpdateDivisor = 2;
+ #endif
+-  if (unacked_recv_window_bytes_ > max_recv_window_size_ / kWindowUpdateDivisor ||
+-      elapsed >= session_->TimeToBufferSmallWindowUpdates()) {
++  const bool window_limited =
++      unacked_recv_window_bytes_ > max_recv_window_size_ / kWindowUpdateDivisor;
++  if (window_limited || elapsed >= session_->TimeToBufferSmallWindowUpdates()) {
++    if (window_limited) {
++      MaybeGrowRecvWindow();
++    }
+     last_recv_window_update_ = base::TimeTicks::Now();
+     // SendStreamWindowUpdate() can result in session draining and stream
+     // destruction if the number of queued capped frames exceeds the limit.
+@@ -296,6 +300,59 @@ void SpdyStream::IncreaseRecvWindowSize(int32_t delta_window_size) {
+   }
+ }
+ 
++void SpdyStream::MaybeGrowRecvWindow() {
++  const base::TimeTicks now = base::TimeTicks::Now();
++  const base::TimeTicks previous = last_window_limited_update_;
++  last_window_limited_update_ = now;
++  const bool previous_fast = last_window_limited_update_fast_;
++  last_window_limited_update_fast_ = false;
++  const int32_t cap = session_->stream_recv_window_cap();
++  if (previous.is_null() || max_recv_window_size_ >= cap) {
++    return;
++  }
++  base::TimeDelta smoothed_rtt, min_rtt;
++  if (!session_->GetTransportRttInfo(&smoothed_rtt, &min_rtt)) {
++    return;
++  }
++  // QUIC's rule (QuicFlowController::MaybeIncreaseMaxWindowSize): half the
++  // window consumed again within two round trips means the sender ran out of
++  // window rather than of data. A reader slower than the path never meets it,
++  // so its window, and the memory a fast sender can fill behind it, stays
++  // small.
++  if (now - previous >= 2 * smoothed_rtt) {
++    return;
++  }
++  // Twice in a row, unlike QUIC: on a relay the hop downstream takes about a
++  // window at once whatever its own reader does (another naive client's 8MB
++  // stream window, a socket's buffers), which is two such updates in quick
++  // succession from a reader that then stalls. One that keeps up makes the
++  // third.
++  last_window_limited_update_fast_ = true;
++  if (!previous_fast) {
++    return;
++  }
++  // QUIC can leave the queue to its own congestion control; this window is
++  // the only thing bounding what a relay keeps in flight, and on a path whose
++  // bottleneck already queues, the smoothed RTT grows with the window and the
++  // rule above would hold all the way to the cap. A smoothed RTT well above
++  // the minimum is that queue: the window stays where it is.
++  if (smoothed_rtt * 2 > min_rtt * 3) {
++    return;
++  }
++  const int32_t grown = static_cast<int32_t>(
++      std::min<int64_t>(int64_t{max_recv_window_size_} * 2, cap));
++  const int32_t delta = grown - max_recv_window_size_;
++  max_recv_window_size_ = grown;
++  // The doubled window proves itself again before the next doubling.
++  last_window_limited_update_fast_ = false;
++  recv_window_size_ += delta;
++  unacked_recv_window_bytes_ += delta;
++  net_log_.AddEvent(NetLogEventType::HTTP2_STREAM_UPDATE_RECV_WINDOW, [&] {
++    return NetLogSpdyStreamWindowUpdateParams(stream_id_, delta,
++                                              recv_window_size_);
++  });
++}
++
+ void SpdyStream::DecreaseRecvWindowSize(int32_t delta_window_size) {
+   DCHECK(session_->IsStreamActive(stream_id_));
+   DCHECK_GE(delta_window_size, 1);
+diff --git a/src/net/spdy/spdy_stream.h b/src/net/spdy/spdy_stream.h
+index 4874b0654..7a3617799 100644
+--- a/src/net/spdy/spdy_stream.h
++++ b/src/net/spdy/spdy_stream.h
+@@ -240,6 +240,12 @@ class NET_EXPORT_PRIVATE SpdyStream {
+   // If stream flow control is turned off, this must not be called.
+   void IncreaseRecvWindowSize(int32_t delta_window_size);
+ 
++  // Doubles the receive window, up to the session's cap, when the window is
++  // what limits this stream; see SpdySession::stream_recv_window_cap.
++  // Called before a WINDOW_UPDATE that half the window being consumed made
++  // due, so the growth goes out with it.
++  void MaybeGrowRecvWindow();
++
+   // Called by OnDataReceived or OnPaddingConsumed (which are in turn called by
+   // the session) to decrease this stream's receive window size by
+   // |delta_window_size|, which must be at least 1.  May close the stream on
+@@ -485,6 +491,12 @@ class NET_EXPORT_PRIVATE SpdyStream {
+   // Time of the last WINDOW_UPDATE for the receive window
+   base::TimeTicks last_recv_window_update_;
+ 
++  // Time of the last WINDOW_UPDATE sent because half the window had been
++  // consumed, which auto-tuning compares against the RTT, and whether that
++  // one came within two RTTs of the one before; see MaybeGrowRecvWindow.
++  base::TimeTicks last_window_limited_update_;
++  bool last_window_limited_update_fast_ = false;
++
+   const base::WeakPtr<SpdySession> session_;
+ 
+   // The transaction should own the delegate.
+-- 
+2.54.0 (Apple Git-157)
+

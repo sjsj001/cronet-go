@@ -1,0 +1,99 @@
+From 8d26e0223aeba7c1b5a5490c9fb40880784990af Mon Sep 17 00:00:00 2001
+From: sjsj001 <>
+Date: Sun, 18 Oct 2026 18:48:29 +0800
+Subject: [PATCH] Hand HTTP/2 stream data that follows a quiet spell to the
+ reader at once
+
+BidirectionalStreamSpdyImpl held every downstream burst for kBufferTimeMs
+(1 ms) before notifying the delegate, and kept waiting while more data
+arrived. For a proxy tunnel that is a millisecond per hop on every
+response, echo and handshake reply. Data that arrives after the stream has
+been quiet for 5 ms is now handed over by a zero-delay task, which still
+runs after the session's current read loop, so one burst is one
+notification; data that keeps arriving is batched as before, which keeps
+the cost of a paced download where it was.
+---
+ .../spdy/bidirectional_stream_spdy_impl.cc    | 25 ++++++++++++++++++-
+ src/net/spdy/bidirectional_stream_spdy_impl.h |  5 ++++
+ 2 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/src/net/spdy/bidirectional_stream_spdy_impl.cc b/src/net/spdy/bidirectional_stream_spdy_impl.cc
+index 9824a3b71..4e9d1c5f0 100644
+--- a/src/net/spdy/bidirectional_stream_spdy_impl.cc
++++ b/src/net/spdy/bidirectional_stream_spdy_impl.cc
+@@ -27,6 +27,13 @@ namespace {
+ // So buffer data in short time-spans and send a single read notification.
+ const int kBufferTimeMs = 1;
+ 
++// cronet-go: data that arrives after the stream has been quiet this long is
++// handed to the reader at once (after the session's current read loop, so a
++// burst read in that loop still goes in one notification) instead of after
++// kBufferTimeMs. A response, an echo or a handshake reply no longer waits a
++// millisecond per proxy hop; data that keeps arriving is batched as before.
++constexpr base::TimeDelta kQuietBeforeImmediateRead = base::Milliseconds(5);
++
+ }  // namespace
+ 
+ BidirectionalStreamSpdyImpl::BidirectionalStreamSpdyImpl(
+@@ -226,10 +233,23 @@ void BidirectionalStreamSpdyImpl::OnDataReceived(
+   if (!buffer)
+     return;
+ 
++  const base::TimeTicks now = base::TimeTicks::Now();
++  const bool after_quiet =
++      now - last_data_received_ >= kQuietBeforeImmediateRead;
++  last_data_received_ = now;
++
+   // When buffer is consumed, SpdyStream::OnReadBufferConsumed will adjust
+   // recv window size accordingly.
+   read_data_queue_.Enqueue(std::move(buffer));
+   if (read_buffer_) {
++    if (after_quiet && !timer_->IsRunning()) {
++      deliver_now_ = true;
++      more_read_data_pending_ = false;
++      timer_->Start(FROM_HERE, base::TimeDelta(),
++                    base::BindOnce(&BidirectionalStreamSpdyImpl::DoBufferedRead,
++                                   weak_factory_.GetWeakPtr()));
++      return;
++    }
+     // Handing small chunks of data to the caller creates measurable overhead.
+     // So buffer data in short time-spans and send a single read notification.
+     ScheduleBufferedRead();
+@@ -371,7 +391,10 @@ void BidirectionalStreamSpdyImpl::DoBufferedRead() {
+ 
+   // When |more_read_data_pending_| is true, it means that more data has arrived
+   // since started waiting. Wait a little longer and continue to buffer.
+-  if (more_read_data_pending_ && ShouldWaitForMoreBufferedData()) {
++  const bool deliver_now = deliver_now_;
++  deliver_now_ = false;
++  if (!deliver_now && more_read_data_pending_ &&
++      ShouldWaitForMoreBufferedData()) {
+     ScheduleBufferedRead();
+     return;
+   }
+diff --git a/src/net/spdy/bidirectional_stream_spdy_impl.h b/src/net/spdy/bidirectional_stream_spdy_impl.h
+index ac20216fb..900f7303e 100644
+--- a/src/net/spdy/bidirectional_stream_spdy_impl.h
++++ b/src/net/spdy/bidirectional_stream_spdy_impl.h
+@@ -13,6 +13,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
+ #include "net/base/load_timing_info.h"
+ #include "net/base/net_export.h"
+ #include "net/http/bidirectional_stream_impl.h"
+@@ -103,6 +104,10 @@ class NET_EXPORT_PRIVATE BidirectionalStreamSpdyImpl
+   SpdyReadQueue read_data_queue_;
+   // Whether received more data has arrived since started waiting.
+   bool more_read_data_pending_ = false;
++  // cronet-go: when data last arrived, and whether the scheduled read hands
++  // it over without waiting for more; see kQuietBeforeImmediateRead.
++  base::TimeTicks last_data_received_;
++  bool deliver_now_ = false;
+   // User provided read buffer for ReadData() response.
+   scoped_refptr<IOBuffer> read_buffer_;
+   int read_buffer_len_ = 0;
+-- 
+2.54.0 (Apple Git-157)
+

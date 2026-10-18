@@ -1,0 +1,385 @@
+From 8f4a79a3bd9299aab2da96c9782bd0571c061829 Mon Sep 17 00:00:00 2001
+From: sjsj001 <>
+Date: Thu, 15 Oct 2026 18:12:31 +0800
+Subject: [PATCH] Dial custom TCP connections off the network thread
+
+CreateTransportClientSocket ran the custom dialer inline, and the dialer
+returns only once TCP is connected. Every stream of the engine waited
+out each new session's handshake with it on the network thread: a
+black-holed proxy stalled them all for the dialer's timeout, and a burst
+of new sessions dialed one after another.
+
+The factory now returns a socket whose Connect runs the dialer on the
+thread pool, under a ScopedBlockingCall, and adopts the descriptor into
+a TCPClientSocket back on the network thread, which then does
+everything else. A socket destroyed before its dial returns, or an
+engine shut down, drops the reply, and the descriptor is closed with it.
+A socket tag applied before Connect is applied once there is a
+descriptor. A socket dials once: connect jobs make a new socket for
+every attempt.
+
+The connect timing is unchanged: connect_start was already taken before
+the factory ran. The connect job's backup timer can now fire during a
+slow dial and start a second one, as it does for system sockets. UDP
+dials stay on the network thread: QUIC connects its socket
+synchronously unless AsyncQuicSession is on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../socket/custom_client_socket_factory.cc    | 257 ++++++++++++++----
+ src/net/socket/custom_client_socket_factory.h |  10 +-
+ 2 files changed, 217 insertions(+), 50 deletions(-)
+
+diff --git a/src/net/socket/custom_client_socket_factory.cc b/src/net/socket/custom_client_socket_factory.cc
+index 1d8c1305..353e893c 100644
+--- a/src/net/socket/custom_client_socket_factory.cc
++++ b/src/net/socket/custom_client_socket_factory.cc
+@@ -10,6 +10,10 @@
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "base/threading/scoped_blocking_call.h"
+ #include "build/build_config.h"
+ 
+ #if BUILDFLAG(IS_WIN)
+@@ -21,6 +25,7 @@
+ #include <unistd.h>
+ #endif
+ #include "base/numerics/byte_conversions.h"
++#include "net/base/address_list.h"
+ #include "net/base/io_buffer.h"
+ #include "net/base/ip_address.h"
+ #include "net/base/ip_endpoint.h"
+@@ -29,12 +34,15 @@
+ #include "net/log/net_log_source.h"
+ #include "net/socket/client_socket_factory.h"
+ #include "net/socket/next_proto.h"
++#include "net/socket/socket_performance_watcher.h"
+ #include "net/socket/socket_descriptor.h"
++#include "net/socket/socket_tag.h"
+ #include "net/socket/tcp_client_socket.h"
+ #include "net/socket/tcp_socket.h"
+ #include "net/socket/udp_client_socket.h"
+ #include "net/traffic_annotation/network_traffic_annotation.h"
+ #if !BUILDFLAG(IS_WIN)
++#include "base/posix/eintr_wrapper.h"
+ #include "net/socket/socket_posix.h"
+ #endif
+ 
+@@ -531,58 +539,230 @@ class ConnectedDatagramClientSocket : public DatagramClientSocket {
+   MutableNetworkTrafficAnnotationTag write_traffic_annotation_;
+ };
+ 
+-// A TransportClientSocket that immediately fails with a predetermined error.
+-class FailingTransportClientSocket : public TransportClientSocket {
++// What a dial produced, held until the socket that asked for it adopts the
++// descriptor. That socket may be gone by then — its connect job timed out, the
++// request was cancelled, the engine shut down — and the descriptor is closed
++// with this instead.
++struct DialResult {
++  DialResult() = default;
++  DialResult(DialResult&& other)
++      : rv(other.rv),
++        socket(std::exchange(other.socket, kInvalidSocket)),
++        endpoint(other.endpoint) {}
++  DialResult& operator=(DialResult&&) = delete;
++  ~DialResult() {
++    if (socket == kInvalidSocket) {
++      return;
++    }
++#if BUILDFLAG(IS_WIN)
++    closesocket(socket);
++#else
++    IGNORE_EINTR(close(socket));
++#endif
++  }
++
++  int rv = ERR_NAME_NOT_RESOLVED;
++  SocketDescriptor socket = kInvalidSocket;
++  IPEndPoint endpoint;
++};
++
++// Tries each address in turn, as the factory used to on the network thread.
++// The dialer returns only once TCP is connected, and there every stream of the
++// engine waited out the handshake with it: a black-holed proxy stalled them all
++// for the dialer's timeout.
++DialResult Dial(const CustomClientSocketFactory::DialerCallback& dialer,
++                const AddressList& addresses) {
++  base::ScopedBlockingCall scoped_blocking_call(FROM_HERE,
++                                                base::BlockingType::WILL_BLOCK);
++  DialResult result;
++  for (const auto& endpoint : addresses) {
++    intptr_t rv = dialer.Run(endpoint.ToStringWithoutPort(), endpoint.port());
++    if (rv >= 0) {
++      result.rv = OK;
++      result.socket = static_cast<SocketDescriptor>(rv);
++      result.endpoint = endpoint;
++      return result;
++    }
++    result.rv = static_cast<int>(rv);
++  }
++  return result;
++}
++
++// A TransportClientSocket that dials with the custom dialer on the thread pool
++// and adopts the descriptor into a TCPClientSocket, which does everything else.
++class DialerTransportClientSocket : public TransportClientSocket {
+  public:
+-  explicit FailingTransportClientSocket(int error_code,
+-                                        const AddressList& addresses,
+-                                        class NetLog* net_log,
+-                                        const NetLogSource& source)
+-      : error_code_(error_code),
++  DialerTransportClientSocket(
++      CustomClientSocketFactory::DialerCallback dialer,
++      const AddressList& addresses,
++      std::unique_ptr<SocketPerformanceWatcher> socket_performance_watcher,
++      class NetLog* net_log,
++      const NetLogSource& source)
++      : dialer_(std::move(dialer)),
+         addresses_(addresses),
+-        net_log_(NetLogWithSource::Make(net_log, NetLogSourceType::SOCKET)) {}
++        socket_performance_watcher_(std::move(socket_performance_watcher)),
++        net_log_(NetLogWithSource::Make(net_log, NetLogSourceType::SOCKET)),
++        source_(source) {}
++
++  DialerTransportClientSocket(const DialerTransportClientSocket&) = delete;
++  DialerTransportClientSocket& operator=(const DialerTransportClientSocket&) =
++      delete;
++
++  ~DialerTransportClientSocket() override = default;
++
++  // One dial per socket: connect jobs make a new socket for every attempt,
++  // and the performance watcher goes with the first.
++  int Connect(CompletionOnceCallback callback) override {
++    if (IsConnected()) {
++      return OK;
++    }
++    if (connect_started_) {
++      return ERR_UNEXPECTED;
++    }
++    connect_started_ = true;
++    connect_callback_ = std::move(callback);
++    base::ThreadPool::PostTask(
++        FROM_HERE,
++        {base::MayBlock(), base::TaskPriority::USER_BLOCKING,
++         base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
++        base::BindOnce(&DialerTransportClientSocket::DialOnThreadPool, dialer_,
++                       addresses_,
++                       base::SequencedTaskRunner::GetCurrentDefault(),
++                       weak_factory_.GetWeakPtr()));
++    return ERR_IO_PENDING;
++  }
++
++  void Disconnect() override {
++    weak_factory_.InvalidateWeakPtrs();
++    connect_callback_.Reset();
++    if (socket_) {
++      socket_->Disconnect();
++    }
++  }
++
++  // The dialer hands over a descriptor already connected, so there is no
++  // moment before the connect to run this at. The synchronous factory never
++  // ran it either: its TCPClientSocket came connected.
++  void SetBeforeConnectCallback(
++      const BeforeConnectCallback& before_connect_callback) override {}
+ 
+-  ~FailingTransportClientSocket() override = default;
++  // Called before Connect; the tag is applied once there is a descriptor.
++  void ApplySocketTag(const SocketTag& tag) override {
++    tag_ = tag;
++    if (socket_) {
++      socket_->ApplySocketTag(tag);
++    }
++  }
+ 
+-  int Bind(const IPEndPoint& local_addr) override { return ERR_FAILED; }
+-  bool SetNoDelay(bool no_delay) override { return false; }
+-  bool SetKeepAlive(bool enable, int delay_secs) override { return false; }
+-  int Connect(CompletionOnceCallback callback) override { return error_code_; }
+-  void Disconnect() override {}
+-  bool IsConnected() const override { return false; }
+-  bool IsConnectedAndIdle() const override { return false; }
++  int Bind(const IPEndPoint& local_addr) override {
++    return ERR_NOT_IMPLEMENTED;
++  }
++  bool SetNoDelay(bool no_delay) override {
++    return socket_ && socket_->SetNoDelay(no_delay);
++  }
++  bool SetKeepAlive(bool enable, int delay_secs) override {
++    return socket_ && socket_->SetKeepAlive(enable, delay_secs);
++  }
++  bool IsConnected() const override { return socket_ && socket_->IsConnected(); }
++  bool IsConnectedAndIdle() const override {
++    return socket_ && socket_->IsConnectedAndIdle();
++  }
+   int GetPeerAddress(IPEndPoint* address) const override {
+-    return ERR_SOCKET_NOT_CONNECTED;
++    return socket_ ? socket_->GetPeerAddress(address)
++                   : ERR_SOCKET_NOT_CONNECTED;
+   }
+   int GetLocalAddress(IPEndPoint* address) const override {
+-    return ERR_SOCKET_NOT_CONNECTED;
++    return socket_ ? socket_->GetLocalAddress(address)
++                   : ERR_SOCKET_NOT_CONNECTED;
+   }
+   const NetLogWithSource& NetLog() const override { return net_log_; }
+-  bool WasEverUsed() const override { return false; }
++  bool WasEverUsed() const override { return socket_ && socket_->WasEverUsed(); }
+   NextProto GetNegotiatedProtocol() const override {
+     return NextProto::kProtoUnknown;
+   }
+   bool GetSSLInfo(SSLInfo* ssl_info) override { return false; }
+-  int64_t GetTotalReceivedBytes() const override { return 0; }
+-  void ApplySocketTag(const SocketTag& tag) override {}
++  int64_t GetTotalReceivedBytes() const override {
++    return socket_ ? socket_->GetTotalReceivedBytes() : 0;
++  }
+   int Read(IOBuffer* buf,
+            int buf_len,
+            CompletionOnceCallback callback) override {
+-    return error_code_;
++    return socket_ ? socket_->Read(buf, buf_len, std::move(callback))
++                   : ERR_SOCKET_NOT_CONNECTED;
++  }
++  int ReadIfReady(IOBuffer* buf,
++                  int buf_len,
++                  CompletionOnceCallback callback) override {
++    return socket_ ? socket_->ReadIfReady(buf, buf_len, std::move(callback))
++                   : ERR_SOCKET_NOT_CONNECTED;
++  }
++  int CancelReadIfReady() override {
++    return socket_ ? socket_->CancelReadIfReady() : ERR_SOCKET_NOT_CONNECTED;
+   }
+   int Write(IOBuffer* buf,
+             int buf_len,
+             CompletionOnceCallback callback,
+             const NetworkTrafficAnnotationTag& traffic_annotation) override {
+-    return error_code_;
++    return socket_ ? socket_->Write(buf, buf_len, std::move(callback),
++                                    traffic_annotation)
++                   : ERR_SOCKET_NOT_CONNECTED;
++  }
++  int SetReceiveBufferSize(int32_t size) override {
++    return socket_ ? socket_->SetReceiveBufferSize(size)
++                   : ERR_SOCKET_NOT_CONNECTED;
++  }
++  int SetSendBufferSize(int32_t size) override {
++    return socket_ ? socket_->SetSendBufferSize(size)
++                   : ERR_SOCKET_NOT_CONNECTED;
+   }
+-  int SetReceiveBufferSize(int32_t size) override { return ERR_FAILED; }
+-  int SetSendBufferSize(int32_t size) override { return ERR_FAILED; }
+ 
+  private:
+-  const int error_code_;
++  // Takes a copy of the dialer, not the factory's: the engine, and the factory
++  // with it, may be destroyed before the dial returns.
++  static void DialOnThreadPool(
++      CustomClientSocketFactory::DialerCallback dialer,
++      AddressList addresses,
++      scoped_refptr<base::SequencedTaskRunner> network_task_runner,
++      base::WeakPtr<DialerTransportClientSocket> socket) {
++    DialResult result = Dial(dialer, addresses);
++    // With the socket gone, OnDialed does not run; with the network thread
++    // gone, the task is dropped. Either way result closes the descriptor.
++    network_task_runner->PostTask(
++        FROM_HERE, base::BindOnce(&DialerTransportClientSocket::OnDialed,
++                                  std::move(socket), std::move(result)));
++  }
++
++  void OnDialed(DialResult result) {
++    int rv = result.rv;
++    if (rv == OK) {
++      std::unique_ptr<TCPSocket> tcp_socket =
++          TCPSocket::Create(std::move(socket_performance_watcher_),
++                            net_log_.net_log(), source_);
++      rv = tcp_socket->AdoptConnectedSocket(result.socket, result.endpoint);
++      // It takes the descriptor, and closes it if it fails, except for an
++      // address it cannot convert, which it refuses before taking it.
++      if (rv != ERR_ADDRESS_INVALID) {
++        result.socket = kInvalidSocket;
++      }
++      if (rv == OK) {
++        socket_ = std::make_unique<TCPClientSocket>(std::move(tcp_socket),
++                                                    result.endpoint);
++        socket_->ApplySocketTag(tag_);
++      }
++    }
++    std::move(connect_callback_).Run(rv);
++  }
++
++  const CustomClientSocketFactory::DialerCallback dialer_;
+   const AddressList addresses_;
+-  NetLogWithSource net_log_;
++  std::unique_ptr<SocketPerformanceWatcher> socket_performance_watcher_;
++  const NetLogWithSource net_log_;
++  const NetLogSource source_;
++  SocketTag tag_;
++  bool connect_started_ = false;
++  CompletionOnceCallback connect_callback_;
++  std::unique_ptr<TCPClientSocket> socket_;
++  base::WeakPtrFactory<DialerTransportClientSocket> weak_factory_{this};
+ };
+ 
+ }  // namespace
+@@ -623,26 +803,9 @@ CustomClientSocketFactory::CreateTransportClientSocket(
+             network_quality_estimator, net_log, source);
+   }
+ 
+-  int last_error = ERR_NAME_NOT_RESOLVED;
+-  for (const auto& endpoint : addresses) {
+-    std::string address_string = endpoint.ToStringWithoutPort();
+-    uint16_t port = endpoint.port();
+-    intptr_t result = tcp_dialer_.Run(address_string, port);
+-    if (result >= 0) {
+-      SocketDescriptor socket_fd = static_cast<SocketDescriptor>(result);
+-      auto tcp_socket = TCPSocket::Create(std::move(socket_performance_watcher),
+-                                          net_log, source);
+-      int adopt_result = tcp_socket->AdoptConnectedSocket(socket_fd, endpoint);
+-      if (adopt_result != OK) {
+-        return std::make_unique<FailingTransportClientSocket>(
+-            adopt_result, addresses, net_log, source);
+-      }
+-      return std::make_unique<TCPClientSocket>(std::move(tcp_socket), endpoint);
+-    }
+-    last_error = static_cast<int>(result);
+-  }
+-  return std::make_unique<FailingTransportClientSocket>(last_error, addresses,
+-                                                        net_log, source);
++  return std::make_unique<DialerTransportClientSocket>(
++      tcp_dialer_, addresses, std::move(socket_performance_watcher), net_log,
++      source);
+ }
+ 
+ std::unique_ptr<SSLClientSocket>
+diff --git a/src/net/socket/custom_client_socket_factory.h b/src/net/socket/custom_client_socket_factory.h
+index d2f49b03..b167e9be 100644
+--- a/src/net/socket/custom_client_socket_factory.h
++++ b/src/net/socket/custom_client_socket_factory.h
+@@ -16,11 +16,15 @@
+ namespace net {
+ 
+ // A ClientSocketFactory that uses a custom dialer callback for TCP connections.
+-// When the dialer is set, CreateTransportClientSocket will call the callback
+-// to get a connected socket file descriptor instead of creating a new socket.
++// When the dialer is set, the sockets CreateTransportClientSocket returns call
++// it on Connect to get a connected socket file descriptor instead of creating
++// a new socket.
+ class NET_EXPORT CustomClientSocketFactory : public ClientSocketFactory {
+  public:
+-  // Callback type for custom TCP dialer.
++  // Callback type for custom TCP dialer. It runs on a thread pool thread, may
++  // run for several connects at once, and may return after the socket that
++  // asked has been destroyed, or the engine has; a descriptor nobody adopts is
++  // closed. It must not call back into the engine.
+   // Parameters:
+   //   - address: IP address string (e.g. "1.2.3.4" or "::1")
+   //   - port: Port number
+-- 
+2.54.0 (Apple Git-157)
+

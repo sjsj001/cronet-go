@@ -54,6 +54,7 @@ func getOutputDirectory(t Target) string {
 }
 
 func build(targets []Target) {
+	applyPatches()
 	log.Printf("Building cronet_static for %d target(s)", len(targets))
 
 	for _, t := range targets {
@@ -62,6 +63,41 @@ func build(targets []Target) {
 	}
 
 	log.Print("Build complete!")
+}
+
+// applyPatches applies patches/naiveproxy/*.patch, in name order, to the
+// naiveproxy checkout: the submodule tracks upstream, and these are the
+// changes carried on top of it. A patch already in the tree is skipped, so a
+// second build changes nothing. One that neither applies nor is already there
+// stops the build: upstream moved under it, and it has to be made again from
+// a checkout with the change. A local build leaves the submodule modified;
+// `git -C naiveproxy checkout .` puts it back.
+// The two sed edits in the linux job of naive-build.yml could move here too;
+// they are linux-only today, and whether clients get them is another decision.
+func applyPatches() {
+	patches, err := filepath.Glob(filepath.Join(projectRoot, "patches", "naiveproxy", "*.patch"))
+	if err != nil {
+		log.Fatalf("list patches: %v", err)
+	}
+	for _, patch := range patches {
+		name := filepath.Base(patch)
+		switch {
+		case gitApplies(patch, "--check"):
+			runCommand(naiveRoot, "git", "apply", patch)
+			log.Printf("Applied %s", name)
+		case gitApplies(patch, "--reverse", "--check"):
+			log.Printf("Already applied: %s", name)
+		default:
+			log.Printf("%s neither applies to naiveproxy nor is already applied:", name)
+			runCommand(naiveRoot, "git", "apply", "--check", patch)
+		}
+	}
+}
+
+func gitApplies(patch string, args ...string) bool {
+	command := exec.Command("git", append(append([]string{"apply"}, args...), patch)...)
+	command.Dir = naiveRoot
+	return command.Run() == nil
 }
 
 func getExtraFlags(t Target) string {

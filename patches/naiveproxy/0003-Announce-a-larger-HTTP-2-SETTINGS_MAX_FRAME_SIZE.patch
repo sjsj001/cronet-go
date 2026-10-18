@@ -1,0 +1,97 @@
+From bd55e961abf2578aeff899ff3f2de8dd28baf1f2 Mon Sep 17 00:00:00 2001
+From: sjsj001 <>
+Date: Sat, 17 Oct 2026 12:35:29 +0800
+Subject: [PATCH] Announce a larger HTTP/2 SETTINGS_MAX_FRAME_SIZE
+
+The HTTP2Options experimental option "max_frame_size" puts
+SETTINGS_MAX_FRAME_SIZE into the session's initial SETTINGS, and the
+session's decoder takes frames up to it from the start. A Go h2 server
+writes each DATA frame through crypto/tls as records of at most 16384
+bytes, one write each, so a 16384-byte frame and its 9-byte header take a
+full record and a 9-byte one. Announcing 64KB let a naive server make 37%
+fewer writes and spend a quarter less CPU per byte sent (loopback, 0.44 to
+0.34 CPU s/GB), at 2.1-2.2 GB/s instead of 1.8.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/components/cronet/url_request_context_config.cc | 12 ++++++++++++
+ src/net/spdy/buffered_spdy_framer.cc                |  4 ++++
+ src/net/spdy/buffered_spdy_framer.h                 |  4 ++++
+ src/net/spdy/spdy_session.cc                        |  8 ++++++++
+ 4 files changed, 28 insertions(+)
+
+diff --git a/src/components/cronet/url_request_context_config.cc b/src/components/cronet/url_request_context_config.cc
+index 2195262eb..d346df42d 100644
+--- a/src/components/cronet/url_request_context_config.cc
++++ b/src/components/cronet/url_request_context_config.cc
+@@ -866,6 +866,18 @@ void URLRequestContextConfig::SetContextBuilderExperimentalOptions(
+             ->http2_settings[spdy::SETTINGS_INITIAL_WINDOW_SIZE] =
+             static_cast<uint32_t>(*initial_window_size);
+       }
++      // A peer sends DATA frames up to this size. Go's h2 server, the naive
++      // server, writes a frame as a TLS record of 16384 bytes plus one of the
++      // 9 left over, each its own write: 64KB frames cut its writes by 37%
++      // and its CPU per byte sent by a quarter.
++      std::optional<int> max_frame_size = args.FindInt("max_frame_size");
++      if (max_frame_size.has_value() &&
++          *max_frame_size >=
++              static_cast<int>(spdy::kHttp2DefaultFramePayloadLimit) &&
++          *max_frame_size <= static_cast<int>(spdy::kSpdyMaxFrameSizeLimit)) {
++        session_params->http2_settings[spdy::SETTINGS_MAX_FRAME_SIZE] =
++            static_cast<uint32_t>(*max_frame_size);
++      }
+       std::optional<bool> stream_window_auto_tuning =
+           args.FindBool("stream_window_auto_tuning");
+       if (stream_window_auto_tuning.has_value()) {
+diff --git a/src/net/spdy/buffered_spdy_framer.cc b/src/net/spdy/buffered_spdy_framer.cc
+index ee4cd1c9a..514dae424 100644
+--- a/src/net/spdy/buffered_spdy_framer.cc
++++ b/src/net/spdy/buffered_spdy_framer.cc
+@@ -230,6 +230,10 @@ void BufferedSpdyFramer::UpdateHeaderDecoderTableSize(uint32_t value) {
+   deframer_.GetHpackDecoder().ApplyHeaderTableSizeSetting(value);
+ }
+ 
++void BufferedSpdyFramer::SetMaxFrameSize(uint32_t value) {
++  deframer_.SetMaxFrameSize(value);
++}
++
+ http2::Http2DecoderAdapter::SpdyFramerError
+ BufferedSpdyFramer::spdy_framer_error() const {
+   return deframer_.spdy_framer_error();
+diff --git a/src/net/spdy/buffered_spdy_framer.h b/src/net/spdy/buffered_spdy_framer.h
+index 8c937752e..e6273cd95 100644
+--- a/src/net/spdy/buffered_spdy_framer.h
++++ b/src/net/spdy/buffered_spdy_framer.h
+@@ -215,6 +215,10 @@ class NET_EXPORT_PRIVATE BufferedSpdyFramer
+   // spdy::SpdyFramer methods.
+   size_t ProcessInput(const char* data, size_t len);
+   void UpdateHeaderDecoderTableSize(uint32_t value);
++
++  // The largest frame payload the decoder accepts; what this end announced
++  // as SETTINGS_MAX_FRAME_SIZE.
++  void SetMaxFrameSize(uint32_t value);
+   http2::Http2DecoderAdapter::SpdyFramerError spdy_framer_error() const;
+   http2::Http2DecoderAdapter::SpdyState state() const;
+   bool MessageFullyRead();
+diff --git a/src/net/spdy/spdy_session.cc b/src/net/spdy/spdy_session.cc
+index 2ec5252f2..5069220a5 100644
+--- a/src/net/spdy/spdy_session.cc
++++ b/src/net/spdy/spdy_session.cc
+@@ -1658,6 +1658,14 @@ void SpdySession::InitializeInternal(SpdySessionPool* pool) {
+   buffered_spdy_framer_->set_visitor(this);
+   buffered_spdy_framer_->set_debug_visitor(this);
+   buffered_spdy_framer_->UpdateHeaderDecoderTableSize(max_header_table_size_);
++  // A larger SETTINGS_MAX_FRAME_SIZE, when configured, goes out in the initial
++  // SETTINGS; the decoder takes frames up to it from the start, which a peer
++  // that has not seen it yet never exceeds.
++  if (auto max_frame_size =
++          initial_settings_.find(spdy::SETTINGS_MAX_FRAME_SIZE);
++      max_frame_size != initial_settings_.end()) {
++    buffered_spdy_framer_->SetMaxFrameSize(max_frame_size->second);
++  }
+ 
+   net_log_.AddEvent(NetLogEventType::HTTP2_SESSION_INITIALIZED, [&] {
+     return NetLogSpdyInitializedParams(socket_->NetLog().source());
+-- 
+2.54.0 (Apple Git-157)
+

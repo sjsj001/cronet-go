@@ -281,6 +281,10 @@ const (
 )
 
 // Dialer is a callback function for custom TCP connection establishment.
+// Cronet calls it on a thread pool thread, not its network thread, so it may
+// block until TCP is connected; calls may run concurrently, and may return
+// after the request, or the engine, that asked is gone, in which case Cronet
+// closes the fd.
 // address: IP address string (e.g. "1.2.3.4" or "::1")
 // port: Port number
 // Returns: connected socket fd on success, negative net error code on failure.

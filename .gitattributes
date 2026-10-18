@@ -1,0 +1,2 @@
+# Patches are applied to the LF checkout of naiveproxy; a CRLF copy would not apply.
+/patches/** text eol=lf
