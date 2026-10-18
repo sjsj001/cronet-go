@@ -3,6 +3,8 @@ package cronet
 import (
 	"encoding/json"
 	"strings"
+
+	E "github.com/sagernet/sing/common/exceptions"
 )
 
 func (p EngineParams) SetExperimentalOption(key string, value any) error {
@@ -75,11 +77,27 @@ func (p EngineParams) SetUseDnsHttpsSvcb(enable bool) error {
 	})
 }
 
-func (p EngineParams) SetHTTP2Options(sessionMaxReceiveWindowSize, initialWindowSize uint64) error {
-	return p.SetExperimentalOption("HTTP2Options", map[string]any{
+// SetHTTP2Options configures the HTTP/2 receive windows. initialWindowSize is
+// the stream window; with streamWindowAutoTuning it is the most a stream's
+// window may grow to, and a session starts its streams at what 1200Mbit/s
+// needs over the path's RTT (8MB at least) when the transport reports one.
+// A libcronet built without patches/naiveproxy/0002 ignores the switch.
+// maxFrameSize, when not zero, is announced as SETTINGS_MAX_FRAME_SIZE and is
+// the largest frame the session then accepts (16384 to 2^24-1; ignored
+// without patches/naiveproxy/0003).
+func (p EngineParams) SetHTTP2Options(sessionMaxReceiveWindowSize, initialWindowSize uint64, streamWindowAutoTuning bool, maxFrameSize uint32) error {
+	if maxFrameSize != 0 && (maxFrameSize < 1<<14 || maxFrameSize > 1<<24-1) {
+		return E.New("HTTP/2 max frame size ", maxFrameSize, " is outside 16384 to 16777215")
+	}
+	options := map[string]any{
 		"session_max_recv_window_size": sessionMaxReceiveWindowSize,
 		"initial_window_size":          initialWindowSize,
-	})
+		"stream_window_auto_tuning":    streamWindowAutoTuning,
+	}
+	if maxFrameSize != 0 {
+		options["max_frame_size"] = maxFrameSize
+	}
+	return p.SetExperimentalOption("HTTP2Options", options)
 }
 
 // SetQUICOptions configures Cronet's QUIC parameters.

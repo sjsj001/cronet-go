@@ -63,10 +63,14 @@ func (e NetError) Is(target error) bool {
 
 	switch target {
 	case net.ErrClosed:
+		// ERR_ABORTED and ERR_NETWORK_CHANGED are this end closing the stream:
+		// a closing engine and Chromium's own network change.
 		return e == NetErrorConnectionClosed ||
 			e == NetErrorSocketNotConnected ||
 			e == NetErrorConnectionReset ||
-			e == NetErrorConnectionAborted
+			e == NetErrorConnectionAborted ||
+			e == NetErrorAborted ||
+			e == NetErrorNetworkChanged
 
 	case os.ErrDeadlineExceeded:
 		return e == NetErrorTimedOut ||

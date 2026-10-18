@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"strconv"
+	"sync"
 
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/baderror"
@@ -197,6 +198,9 @@ type NaiveConn interface {
 	// ResponseHeader returns a header from the proxy's response, available once
 	// the handshake has completed.
 	ResponseHeader(key string) (string, bool)
+	// CloseWrite ends the request stream and leaves the response open, so a
+	// caller that half-closes still gets its answer.
+	CloseWrite() error
 }
 
 // HandshakeError reports a proxy response whose status was not 200. Callers use
@@ -215,6 +219,9 @@ type naiveConn struct {
 	ctx    context.Context
 	conn   *BidirectionalConn
 	logger logger.ContextLogger
+	// reportOnce keeps the handshake's outcome to one line per connection: see
+	// handshakeFailed for why the same answer is asked for twice.
+	reportOnce sync.Once
 	paddingConn
 }
 
@@ -246,15 +253,21 @@ func (c *naiveConn) HandshakeContext(ctx context.Context) error {
 // speculatively, and on a preconnect host that is the ordinary case rather than
 // the exception — measured on one deployment at 51 of 63 dials to a CDN name,
 // against 1 of 1303 to a name actually in use. Reported as warnings they bury
-// the answers that are real, and each one arrives twice, because every dial is
+// the answers that are real. ERR_ABORTED and ERR_NETWORK_CHANGED are the same
+// thing by another route: only this end produces them, the first when the
+// engine closes every connection, the second on Chromium's own network change.
+//
+// A real failure is reported once per connection, although every dial is
 // measured twice: once by whoever is ranking the path, once by the detached
-// line that records it.
+// line that records it. An abandoned wait stays out of that: it is the
+// caller's, and the stream's answer may still come to the other one.
 func (c *naiveConn) handshakeFailed(err error) error {
-	if errors.Is(err, ErrClosedLocally) || errors.Is(err, context.Canceled) {
+	if errors.Is(err, ErrClosedLocally) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, NetErrorAborted) || errors.Is(err, NetErrorNetworkChanged) {
 		c.logger.DebugContext(c.ctx, "handshake abandoned: ", err)
 		return err
 	}
-	c.logger.WarnContext(c.ctx, "handshake failed: ", err)
+	c.reportOnce.Do(func() { c.logger.WarnContext(c.ctx, "handshake failed: ", err) })
 	return err
 }
 
@@ -262,10 +275,10 @@ func (c *naiveConn) checkStatus(headers map[string]string) error {
 	if headers[":status"] != "200" {
 		statusCode, _ := strconv.Atoi(headers[":status"])
 		err := error(&HandshakeError{StatusCode: statusCode})
-		c.logger.WarnContext(c.ctx, "handshake failed: ", err)
+		c.reportOnce.Do(func() { c.logger.WarnContext(c.ctx, "handshake failed: ", err) })
 		return err
 	}
-	c.logger.DebugContext(c.ctx, "handshake succeeded")
+	c.reportOnce.Do(func() { c.logger.DebugContext(c.ctx, "handshake succeeded") })
 	return nil
 }
 
@@ -299,6 +312,12 @@ func (c *naiveConn) Read(p []byte) (n int, err error) {
 func (c *naiveConn) Write(p []byte) (n int, err error) {
 	n, err = c.writeChunked(c.Conn, p)
 	return n, baderror.WrapH2(err)
+}
+
+// CloseWrite needs nothing from the padding layer: end of stream is a frame
+// boundary, which is where the far side's padding reader expects one.
+func (c *naiveConn) CloseWrite() error {
+	return c.conn.CloseWrite()
 }
 
 func (c *naiveConn) WriteBuffer(buffer *buf.Buffer) error {

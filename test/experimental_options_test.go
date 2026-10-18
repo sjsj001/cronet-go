@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"testing"
 
 	cronet "github.com/sagernet/cronet-go"
@@ -13,6 +14,19 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+// expectedInitialStreamWindow is the stream window a naive client with no
+// configured window announces on loopback for a ceiling of configured: where
+// the transport reports its RTT (Linux), patches/naiveproxy/0002 starts
+// streams at 1200 Mbit/s times that RTT, 8 MB at least, which on loopback is
+// the 8 MB; elsewhere at the ceiling.
+func expectedInitialStreamWindow(configured int) int {
+	const floor = 8 * 1024 * 1024
+	if (runtime.GOOS == "linux" || runtime.GOOS == "android") && configured > floor {
+		return floor
+	}
+	return configured
+}
 
 type netLogData struct {
 	Constants struct {
@@ -77,6 +91,18 @@ func TestHTTP2Options(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, testData, buffer)
 
+	// The echo writes 32KB at a time, so the server may answer in DATA frames
+	// larger than 16KB once 64KB ones are announced, and they must decode.
+	bulk := make([]byte, 1<<20)
+	for i := range bulk {
+		bulk[i] = byte(i * 7)
+	}
+	go conn.Write(bulk)
+	echoed := make([]byte, len(bulk))
+	_, err = io.ReadFull(conn, echoed)
+	require.NoError(t, err)
+	require.Equal(t, bulk, echoed)
+
 	conn.Close()
 	client.Engine().StopNetLog()
 
@@ -97,7 +123,7 @@ func TestHTTP2Options(t *testing.T) {
 	require.NoError(t, err)
 
 	// HTTP2_SESSION_SEND_SETTINGS should contain SETTINGS_INITIAL_WINDOW_SIZE =
-	// 67108864 (64 MB, naive default).
+	// 67108864 (64 MB, naive default), or the auto-tuned start below it.
 	sendSettingsType, ok := netLog.Constants.LogEventTypes["HTTP2_SESSION_SEND_SETTINGS"]
 	require.True(t, ok, "expected HTTP2_SESSION_SEND_SETTINGS in NetLog constants")
 	sendSettingsFound := false
@@ -109,8 +135,24 @@ func TestHTTP2Options(t *testing.T) {
 	}
 	require.True(t, sendSettingsFound, "expected HTTP2_SESSION_SEND_SETTINGS event in netlog")
 	require.Contains(t, logString,
-		fmt.Sprintf("SETTINGS_INITIAL_WINDOW_SIZE) value:%d]", streamInitialWindowSize),
-		"expected SETTINGS_INITIAL_WINDOW_SIZE = 64 MB in HTTP/2 SETTINGS")
+		fmt.Sprintf("SETTINGS_INITIAL_WINDOW_SIZE) value:%d]", expectedInitialStreamWindow(streamInitialWindowSize)),
+		"expected SETTINGS_INITIAL_WINDOW_SIZE = 64 MB (8 MB auto-tuned) in HTTP/2 SETTINGS")
+	require.Contains(t, logString, "SETTINGS_MAX_FRAME_SIZE) value:65536]",
+		"expected SETTINGS_MAX_FRAME_SIZE = 64 KB in HTTP/2 SETTINGS")
+	recvDataType, ok := netLog.Constants.LogEventTypes["HTTP2_SESSION_RECV_DATA"]
+	require.True(t, ok, "expected HTTP2_SESSION_RECV_DATA in NetLog constants")
+	largestFrame := 0
+	for _, event := range netLog.Events {
+		if event.Type != recvDataType {
+			continue
+		}
+		var params struct {
+			Size int `json:"size"`
+		}
+		require.NoError(t, json.Unmarshal(event.Params, &params))
+		largestFrame = max(largestFrame, params.Size)
+	}
+	require.Greater(t, largestFrame, 16384, "expected a DATA frame larger than 16 KB to be received")
 
 	// HTTP2_SESSION_SEND_WINDOW_UPDATE with stream_id 0 should carry
 	// delta = session_max_recv_window_size - default_initial_window_size.
@@ -310,7 +352,7 @@ func TestHTTP2StreamReceiveWindowCustom(t *testing.T) {
 
 	require.Contains(t, logString,
 		fmt.Sprintf("SETTINGS_INITIAL_WINDOW_SIZE) value:%d]", expectedInitialWindowSize),
-		"expected SETTINGS_INITIAL_WINDOW_SIZE = 16 MB")
+		"expected SETTINGS_INITIAL_WINDOW_SIZE = 16 MB: a configured window is not auto-tuned")
 
 	var netLog netLogData
 	err = json.Unmarshal(logContent, &netLog)

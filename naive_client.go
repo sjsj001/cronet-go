@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"maps"
+	"math/rand"
 	"net"
 	"net/url"
 	"os"
@@ -35,6 +37,15 @@ const (
 	QUICCongestionControlCubic QUICCongestionControl = "CQBC"
 	QUICCongestionControlReno  QUICCongestionControl = "RENO"
 )
+
+// h2MaxFrameSize is the SETTINGS_MAX_FRAME_SIZE a naive client announces. A Go
+// h2 server, the naive server, writes each frame through crypto/tls as records
+// of up to 16384 bytes, one write each: a 16384-byte DATA frame with its
+// 9-byte header is a full record and a 9-byte one. At 64KB the server made 37%
+// fewer writes and spent a quarter less CPU per byte sent (loopback); larger
+// frames saved nothing more and would only coarsen how a relay interleaves
+// streams on a slow link.
+const h2MaxFrameSize = 64 * 1024
 
 type clientState uint32
 
@@ -75,6 +86,9 @@ type NaiveClient struct {
 	engines                  []Engine
 	streamEngines            []StreamEngine
 	activeConnections        sync.WaitGroup
+	engineAccess             sync.RWMutex
+	proxyAccess              sync.Mutex
+	proxyClosed              bool
 	proxyWaitGroup           sync.WaitGroup
 	proxyCancel              context.CancelFunc
 }
@@ -189,6 +203,13 @@ func NewNaiveClient(config NaiveClientOptions) (*NaiveClient, error) {
 	}, nil
 }
 
+// DefaultH2ReceiveWindow is the HTTP/2 session window a naive client uses when
+// none is configured. Configuring it keeps that window and fixes it: streams
+// are auto-tuned only when no window is configured.
+func DefaultH2ReceiveWindow() uint64 {
+	return effectiveH2ReceiveWindow(0)
+}
+
 // effectiveH2ReceiveWindow resolves the configured session window to what the
 // engine will actually announce, defaults included — the pool cap must be
 // derived from the real window, not from a zero that means "default".
@@ -203,8 +224,8 @@ func effectiveH2ReceiveWindow(configured uint64) uint64 {
 }
 
 // Pools reports how many isolated connections streams are currently spread
-// over: the live pool count when adaptive, the fixed setting otherwise. A
-// warmup pass uses it to leave none of them cold.
+// over: the live pool count when adaptive, the fixed setting otherwise. For
+// integration tests and diagnostics.
 func (c *NaiveClient) Pools() int {
 	if c.adaptive {
 		return c.pools.InUse()
@@ -279,7 +300,13 @@ func (c *NaiveClient) Start() error {
 		c.logger.DebugContext(c.ctx, "open TCP connection to ", destination)
 		conn, err := c.dialer.DialContext(proxyContext, N.NetworkTCP, destination)
 		if err != nil {
-			c.logger.ErrorContext(c.ctx, "open TCP connection to ", destination, ": ", err)
+			if errors.Is(err, context.Canceled) {
+				// The client is closing and cancelled the dial: nothing failed.
+				c.logger.DebugContext(c.ctx, "open TCP connection to ", destination, ": ", err)
+			} else {
+				c.logger.ErrorContext(c.ctx, "open TCP connection to ", destination, ": ", err)
+				c.pools.DialFailed()
+			}
 			return toNetError(err).Code()
 		}
 
@@ -292,14 +319,18 @@ func (c *NaiveClient) Start() error {
 		}
 
 		c.logger.DebugContext(c.ctx, "relaying TCP connection to ", destination)
+		if !c.beginRelay() {
+			conn.Close()
+			return NetErrorAborted.Code()
+		}
 		fd, pipeConn, err := createSocketPair()
 		if err != nil {
+			c.proxyWaitGroup.Done()
 			c.logger.ErrorContext(c.ctx, "socket pair failed: ", err)
 			conn.Close()
 			return NetErrorConnectionFailed.Code()
 		}
 
-		c.proxyWaitGroup.Add(1)
 		go func() {
 			defer c.proxyWaitGroup.Done()
 			bufio.CopyConn(proxyContext, conn, pipeConn)
@@ -355,8 +386,13 @@ func (c *NaiveClient) Start() error {
 		}
 
 		c.logger.DebugContext(c.ctx, "relaying UDP connection to ", destination)
+		if !c.beginRelay() {
+			conn.Close()
+			return NetErrorAborted.Code(), "", 0, nil
+		}
 		fd, pipeConn, err := createPacketSocketPair(c.testForceUDPLoopback)
 		if err != nil {
+			c.proxyWaitGroup.Done()
 			c.logger.ErrorContext(c.ctx, "socket pair failed: ", err)
 			conn.Close()
 			return NetErrorConnectionFailed.Code(), "", 0, nil
@@ -367,7 +403,6 @@ func (c *NaiveClient) Start() error {
 		pipePacketConn := bufio.NewUnbindPacketConnWithAddr(pipeConn.(net.Conn), remoteAddress)
 
 		relayContext, relayCancel := context.WithCancel(proxyContext)
-		c.proxyWaitGroup.Add(1)
 		go func() {
 			defer c.proxyWaitGroup.Done()
 			defer relayCancel()
@@ -450,7 +485,11 @@ func (c *NaiveClient) startEngine(tcpDialer Dialer, udpDialer UDPDialer, dnsServ
 			paramsError = params.SetQUICOptions("", string(c.quicCongestionControl), streamReceiveWindow, sessionReceiveWindow)
 		} else {
 			receiveWindow := effectiveH2ReceiveWindow(c.receiveWindow)
-			paramsError = params.SetHTTP2Options(receiveWindow, receiveWindow/2)
+			// Auto-tuned unless a window is configured, which is then the
+			// fixed window as before: the RTT is the one of the TCP socket the
+			// dialer handed over, which through a SOCKS or HTTP detour is only
+			// the hop to that proxy.
+			paramsError = params.SetHTTP2Options(receiveWindow, receiveWindow/2, c.receiveWindow == 0, h2MaxFrameSize)
 		}
 	}
 	if paramsError == nil {
@@ -479,6 +518,8 @@ func (c *NaiveClient) Engine() Engine {
 }
 
 func (c *NaiveClient) CloseAllConnections() {
+	c.engineAccess.RLock()
+	defer c.engineAccess.RUnlock()
 	if clientState(c.state.Load()) != clientStateRunning {
 		return
 	}
@@ -517,14 +558,19 @@ func (c *NaiveClient) DialEarly(ctx context.Context, destination M.Socksaddr) (N
 		headers[key] = value
 	}
 
-	stream := c.pools.Allocate(destination.String())
+	c.engineAccess.RLock()
+	defer c.engineAccess.RUnlock()
+	if clientState(c.state.Load()) != clientStateRunning {
+		return nil, net.ErrClosed
+	}
+	stream := c.allocate(destination.String(), headers)
 	conn, err := c.startStream(ctx, headers, stream)
 	if err != nil {
 		stream.Release()
 		// A synchronous Start failure means nothing reached the wire, so one
 		// clean retry costs nothing. (The idled-out-session race surfaces
 		// asynchronously and is DialContext's retry to make.)
-		stream = c.pools.Allocate(destination.String())
+		stream = c.allocate(destination.String(), headers)
 		conn, err = c.startStream(ctx, headers, stream)
 		if err != nil {
 			stream.Release()
@@ -534,11 +580,38 @@ func (c *NaiveClient) DialEarly(ctx context.Context, destination M.Socksaddr) (N
 	trackedConn := &trackedNaiveConn{
 		NaiveConn:  NewNaiveConn(ctx, conn, c.logger),
 		client:     c,
+		conn:       conn,
 		poolStream: stream,
 	}
 	c.activeConnections.Add(1)
 	conn.setOnTerminate(trackedConn.release)
 	return trackedConn, nil
+}
+
+// allocate opens the warm-up a stream comes with, to a .probe.arpa name a
+// sing-box naive server answers without dialing; engineAccess is held, so the
+// warm-up is counted before Close passes its barrier.
+func (c *NaiveClient) allocate(destination string, headers map[string]string) *pool.Stream {
+	stream := c.pools.Allocate(destination)
+	warmup := stream.Warmup()
+	if warmup == nil {
+		return stream
+	}
+	headers = maps.Clone(headers)
+	headers["-connect-authority"] = F.ToString(rand.Uint64(), ".probe.arpa:443")
+	conn, err := c.startStream(c.ctx, headers, warmup)
+	if err != nil {
+		warmup.Release()
+		return stream
+	}
+	tracked := &trackedNaiveConn{client: c, conn: conn, poolStream: warmup}
+	c.activeConnections.Add(1)
+	go func() {
+		_ = conn.WaitReady(c.ctx)
+		conn.Close()
+		tracked.release()
+	}()
+	return stream
 }
 
 func (c *NaiveClient) startStream(ctx context.Context, headers map[string]string, stream *pool.Stream) (*BidirectionalConn, error) {
@@ -563,6 +636,7 @@ func (c *NaiveClient) startStream(ctx context.Context, headers map[string]string
 	}
 	conn := streamEngine.CreateConn(ctx, c.logger, true, false)
 	conn.setOnTraffic(stream.Note)
+	conn.setOnReady(stream.Connected)
 	err := conn.Start("CONNECT", c.serverURL, headers, 0, false)
 	if err != nil {
 		return nil, err
@@ -646,9 +720,20 @@ func (c *NaiveClient) doClose() error {
 		c.proxyCancel()
 	}
 
+	// Engine users hold engineAccess shared from their Running check until
+	// done with the engine (a dial: until its stream is counted). The state
+	// left Running, so past this barrier none reaches a destroyed engine or
+	// races Add with Wait. It follows proxyCancel, which unblocks a network
+	// thread stuck dialing that such a holder may be waiting on.
+	c.engineAccess.Lock()
+	c.engineAccess.Unlock()
+
 	for _, engine := range c.engines {
 		engine.CloseAllConnections()
 	}
+	c.proxyAccess.Lock()
+	c.proxyClosed = true
+	c.proxyAccess.Unlock()
 	c.proxyWaitGroup.Wait()
 	c.activeConnections.Wait()
 	for _, engine := range c.engines {
@@ -660,6 +745,20 @@ func (c *NaiveClient) doClose() error {
 	return nil
 }
 
+// beginRelay counts a relay into proxyWaitGroup, or reports false once doClose
+// has begun its Wait. The dialers run on Cronet's threads, a TCP dial on a
+// thread pool thread that can outlive the engine, so one can finish while
+// doClose waits, and an Add from zero must not race that Wait.
+func (c *NaiveClient) beginRelay() bool {
+	c.proxyAccess.Lock()
+	defer c.proxyAccess.Unlock()
+	if c.proxyClosed {
+		return false
+	}
+	c.proxyWaitGroup.Add(1)
+	return true
+}
+
 func (c *NaiveClient) getECHConfigList() []byte {
 	c.echMutex.RLock()
 	defer c.echMutex.RUnlock()
@@ -669,13 +768,18 @@ func (c *NaiveClient) getECHConfigList() []byte {
 type trackedNaiveConn struct {
 	NaiveConn
 	client     *NaiveClient
+	conn       *BidirectionalConn
 	poolStream *pool.Stream
 	closeOnce  sync.Once
 }
 
 func (c *trackedNaiveConn) release() {
 	c.closeOnce.Do(func() {
-		c.poolStream.Release()
+		if c.conn.failedToConnect() {
+			c.poolStream.ReleaseUnconnected()
+		} else {
+			c.poolStream.Release()
+		}
 		c.client.activeConnections.Done()
 	})
 }
