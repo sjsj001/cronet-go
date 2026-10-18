@@ -51,6 +51,19 @@ const (
 	// the window the slot is a fresh handshake like any other.
 	warmSlotWindow = 110 * time.Second
 
+	// While a fresh pool dials, a pool with a session takes the streams it
+	// would get, up to this many, sparing them a TCP and a TLS round trip. The
+	// bound is how much zero-byte bulk can pile onto one connection for good.
+	maxActivesWhileDialing = 2 * maxActivesPerPool
+
+	// After a second failed dial within dialFailureWindow, new streams take
+	// only slots that need no dial for dialHoldOff; see DialFailed. Failures
+	// closer together than dialFailureGap are one: Chromium races a backup
+	// connection against a slow first one, and both time out together.
+	dialHoldOff       = 30 * time.Second
+	dialFailureWindow = time.Minute
+	dialFailureGap    = time.Second
+
 	minPoolCap = 2
 	maxPoolCap = 16
 
@@ -90,6 +103,9 @@ type Allocator struct {
 	ceiling  int
 	pools    []*poolState
 	now      func() time.Time // fixed in tests to travel time
+	// Until then, place streams on slots with a session behind them.
+	dialsHeldUntil  time.Time
+	lastDialFailure time.Time
 }
 
 type poolState struct {
@@ -124,6 +140,8 @@ type Stream struct {
 	destination string
 	mu          sync.Mutex
 	released    bool
+	connected   bool // its request reached the wire: the slot has a session
+	warmup      *Stream
 	buckets     [bucketCount]uint64
 	bucketAt    [bucketCount]int64
 }
@@ -139,17 +157,37 @@ func (a *Allocator) Allocate(destination string) *Stream {
 	for len(a.pools) <= index {
 		a.pools = append(a.pools, &poolState{streams: make(map[*Stream]struct{})})
 	}
-	state := a.pools[index]
 	stream := &Stream{alloc: a, pool: index, destination: destination}
-	state.streams[stream] = struct{}{}
+	if now := a.now(); a.adaptive && !dialFreeLocked(a.pools[index], now) {
+		hot := -1
+		for i, state := range a.pools {
+			if len(state.streams) < maxActivesWhileDialing && dialFreeLocked(state, now) &&
+				!a.poolHasElephantLocked(state, now) && (hot == -1 || len(state.streams) < len(a.pools[hot].streams)) {
+				hot = i
+			}
+		}
+		if hot != -1 {
+			if len(a.pools[index].streams) == 0 {
+				stream.warmup = &Stream{alloc: a, pool: index}
+				a.pools[index].streams[stream.warmup] = struct{}{}
+			}
+			stream.pool = hot
+		}
+	}
+	a.pools[stream.pool].streams[stream] = struct{}{}
 	return stream
 }
 
 func (a *Allocator) chooseLocked(destination string) int {
+	if now := a.now(); now.Before(a.dialsHeldUntil) {
+		if index := a.chooseDialFreeLocked(destination, now); index != -1 {
+			return index
+		}
+	}
 	if !a.adaptive {
 		// Fixed means N warm pipes, so spread over all of them before packing
-		// — that is what an explicit setting buys, and what a warmup pass
-		// counting Pools assumes. The elephant and same-destination guards
+		// — that is what an explicit setting buys. The elephant and
+		// same-destination guards
 		// ride along: they cost nothing while every pipe is quiet, and are
 		// the whole point when one is not.
 		if index := a.leastBusyAvoidingLocked(destination, a.now()); index != -1 {
@@ -203,10 +241,55 @@ func (a *Allocator) chooseLocked(destination string) int {
 	if cold != -1 {
 		return cold
 	}
-	// At the ceiling with every pool loaded or elephant-ridden: degrade to
-	// the least busy pipe rather than refusing. This is the documented
-	// worst case — full load shares with bulk, exactly like today.
+	// At the ceiling. A loaded pool without an elephant still beats one with:
+	// the elephant's pool is the least busy only because the scan above left
+	// it out, and sending new streams there put probes and interactive
+	// traffic behind bulk exactly when the pools were busiest.
+	if best != -1 {
+		return best
+	}
+	// Every pool elephant-ridden: degrade to the least busy pipe rather than
+	// refusing. This is the documented worst case — full load shares with
+	// bulk, exactly like today.
 	return a.leastBusyLocked()
+}
+
+// chooseDialFreeLocked places a stream while dials are held off: on the least
+// busy slot that needs none, one without an elephant or a parallel stream to
+// this destination first. -1 when every slot would need a dial.
+func (a *Allocator) chooseDialFreeLocked(destination string, now time.Time) int {
+	best, fallback := -1, -1
+	for i, state := range a.pools {
+		if i >= a.ceiling || !dialFreeLocked(state, now) {
+			continue
+		}
+		if fallback == -1 || len(state.streams) < len(a.pools[fallback].streams) {
+			fallback = i
+		}
+		if a.poolHasElephantLocked(state, now) ||
+			destinationCountLocked(state, destination) >= sameDestinationCap {
+			continue
+		}
+		if best == -1 || len(state.streams) < len(a.pools[best].streams) {
+			best = i
+		}
+	}
+	if best != -1 {
+		return best
+	}
+	return fallback
+}
+
+// dialFreeLocked reports whether a slot has a session behind it: a stream on
+// it connected, or one that had drained from it within warmSlotWindow. A slot
+// whose streams are all still dialing does not count.
+func dialFreeLocked(state *poolState, now time.Time) bool {
+	for stream := range state.streams {
+		if stream.connected {
+			return true
+		}
+	}
+	return !state.lastActiveAt.IsZero() && now.Sub(state.lastActiveAt) < warmSlotWindow
 }
 
 func destinationCountLocked(state *poolState, destination string) int {
@@ -267,9 +350,9 @@ func (a *Allocator) poolHasElephantLocked(state *poolState, now time.Time) bool 
 	return false
 }
 
-// InUse reports how many pools currently carry at least one stream — the
-// number a warmup pass has to cover to leave none of them cold. Never below
-// one: an idle client is one dial away from pool 0.
+// InUse reports how many pools currently carry at least one stream, for
+// integration tests and diagnostics. Never below one: an idle client is one
+// dial away from pool 0.
 func (a *Allocator) InUse() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -288,6 +371,12 @@ func (a *Allocator) InUse() int {
 // Pool is the index this stream was placed on.
 func (s *Stream) Pool() int {
 	return s.pool
+}
+
+// Warmup, if not nil, is placed on the pool this stream would have dialed: the
+// caller opens it to the server and drops it once connected.
+func (s *Stream) Warmup() *Stream {
+	return s.warmup
 }
 
 // Note records n bytes moving on this stream, in either direction.
@@ -319,7 +408,17 @@ func (s *Stream) windowedBytes(now time.Time) uint64 {
 	return sum
 }
 
+// Connected records that the stream's request reached the wire, so its slot
+// has a session.
+func (s *Stream) Connected() {
+	s.alloc.mu.Lock()
+	s.connected = true
+	s.alloc.mu.Unlock()
+}
+
 // Release returns the stream's slot. Idempotent, because close paths overlap.
+// Only a stream that connected leaves its slot warm: one dropped while its
+// dial was still under way says nothing of a session there.
 func (s *Stream) Release() {
 	a := s.alloc
 	a.mu.Lock()
@@ -330,5 +429,45 @@ func (s *Stream) Release() {
 	s.released = true
 	state := a.pools[s.pool]
 	delete(state.streams, s)
-	state.lastActiveAt = a.now()
+	if s.connected {
+		state.lastActiveAt = a.now()
+	}
+}
+
+// ReleaseUnconnected is Release for a stream that ended on the error of a
+// failed connection attempt: its slot is left cold, since no session came of
+// it, even if one drained from it recently.
+func (s *Stream) ReleaseUnconnected() {
+	a := s.alloc
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if s.released {
+		return
+	}
+	s.released = true
+	state := a.pools[s.pool]
+	delete(state.streams, s)
+	state.lastActiveAt = time.Time{}
+}
+
+// DialFailed records a failed dial to the server. Behind a bottleneck that
+// queues for longer than a dial may take, a fresh connection's handshake
+// waits in that queue and every dial times out the same way, while the
+// connections already up still answer, slowly. A second failure within
+// dialFailureWindow holds dials off for dialHoldOff: new streams ride the
+// slots that have a session instead of dialing again. One failure alone does
+// not, since it may be a passing one. It is counted where the dial fails, not
+// where a stream does: a caller racing several paths drops a stream that
+// waits on a slow dial long before the dial gives up.
+func (a *Allocator) DialFailed() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := a.now()
+	if !a.lastDialFailure.IsZero() && now.Sub(a.lastDialFailure) < dialFailureGap {
+		return
+	}
+	if !a.lastDialFailure.IsZero() && now.Sub(a.lastDialFailure) < dialFailureWindow {
+		a.dialsHeldUntil = now.Add(dialHoldOff)
+	}
+	a.lastDialFailure = now
 }

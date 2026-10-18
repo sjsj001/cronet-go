@@ -183,6 +183,25 @@ func TestAllElephantsAtCapDegrade(t *testing.T) {
 	}
 }
 
+// At the cap with the other pools full, a new stream still goes to a pool
+// without an elephant. The elephant's pool looked least busy only because the
+// scan had left it out.
+func TestAtCapNewStreamsStillAvoidTheElephant(t *testing.T) {
+	a, _ := newTestAllocator(3)
+	bulk := a.Allocate("bulk:443")
+	bulk.Note(5 << 20)
+	for i := range 2 * maxActivesPerPool {
+		if a.Allocate(fmt.Sprint("light", i, ":443")).Pool() == bulk.Pool() {
+			t.Fatal("a light stream joined the elephant's pool before the cap")
+		}
+	}
+	for i := range 3 {
+		if pool := a.Allocate(fmt.Sprint("late", i, ":443")).Pool(); pool == bulk.Pool() {
+			t.Fatalf("stream %d placed on the elephant's pool %d at the cap", i, pool)
+		}
+	}
+}
+
 // The cap follows memory ÷ window, clamped to [2, 16], and an
 // unreadable memory total is treated as the smallest production box.
 func TestCapDerivation(t *testing.T) {
@@ -190,11 +209,13 @@ func TestCapDerivation(t *testing.T) {
 		memory, window uint64
 		want           int
 	}{
-		{2 << 30, 20 << 20, 16}, // 512MB budget / 20MB — clamped at the top
-		{2 << 30, 96 << 20, 5},  // the spec's long-leg example
-		{1 << 30, 96 << 20, 2},  // small box, big window — floor keeps two
-		{0, 128 << 20, 4},       // unknown host: 512MB assumed budget
-		{64 << 30, 1 << 20, 16}, // absurd inputs still clamp
+		{2 << 30, 20 << 20, 16},    // 512MB budget / 20MB — clamped at the top
+		{2 << 30, 96 << 20, 5},     // the spec's long-leg example
+		{1961 << 20, 128 << 20, 3}, // a real 2GB Linux box: MemTotal is short of 2GiB by the kernel's reserve, so three, not four
+		{1 << 30, 96 << 20, 2},     // small box, big window — floor keeps two
+		{0, 128 << 20, 4},          // unknown host: 512MB assumed budget
+		{64 << 20, 4 << 20, 4},     // iOS: four 4MB windows inside the extension's limit
+		{64 << 30, 1 << 20, 16},    // absurd inputs still clamp
 		{256 << 20, 128 << 20, 2},
 	}
 	for _, c := range cases {
@@ -366,8 +387,7 @@ func TestSameDestinationSpreadsDistinctPack(t *testing.T) {
 func TestWarmSlotPreferredOverCold(t *testing.T) {
 	a, c := newTestAllocator(16)
 	var pool0, pool1 []*Stream
-	for i := 0; i < 4; i++ {
-		s := a.Allocate("seed:443")
+	for _, s := range connectedBurst(a, "seed:443", 4) {
 		if s.Pool() == 0 {
 			pool0 = append(pool0, s)
 		} else {
@@ -437,5 +457,260 @@ func TestBrowsingAfterBurstDoesNotFanOut(t *testing.T) {
 	if highest >= minSpreadPools {
 		t.Fatalf("browsing reached pool %d; the %d-pool burst should have left everything above %d idle",
 			highest, opened, minSpreadPools-1)
+	}
+}
+
+// connectedStream places a stream and marks it connected, as a stream whose
+// request reached the wire.
+func connectedStream(a *Allocator, destination string) *Stream {
+	s := a.Allocate(destination)
+	s.Connected()
+	return s
+}
+
+// connectedBurst places n streams to destination at once and only then marks
+// them connected: none had a session when placed, so they spread as a cold
+// burst does.
+func connectedBurst(a *Allocator, destination string, n int) []*Stream {
+	streams := make([]*Stream, n)
+	for i := range streams {
+		streams[i] = a.Allocate(destination)
+	}
+	for _, s := range streams {
+		s.Connected()
+	}
+	return streams
+}
+
+// failTwice records two failed dials far enough apart to count as two.
+func failTwice(a *Allocator, c *clock) {
+	a.DialFailed()
+	c.advance(2 * dialFailureGap)
+	a.DialFailed()
+}
+
+// A second failed dial within the window holds off dials: while the hold
+// lasts a new stream rides a pool that has a session, even one it would
+// otherwise avoid, and nothing dials the fresh pool whose dial just timed out
+// behind a saturated bottleneck. One failure alone does not hold dials off.
+// When the hold ends the allocator dials again, and the failed slot is not
+// mistaken for a warm one.
+func TestFailedDialsHoldOffNewPools(t *testing.T) {
+	a, c := newTestAllocator(16)
+	connectedBurst(a, "hub:443", 8)
+	dial := a.Allocate("hub:443").Warmup()
+	if dial == nil || dial.Pool() != 4 {
+		t.Fatalf("ninth stream to the same destination dialed %v, want fresh pool 4", dialedPool(dial))
+	}
+	a.DialFailed()
+	dial.ReleaseUnconnected()
+	dial = a.Allocate("hub:443").Warmup()
+	if dial == nil || dial.Pool() != 4 {
+		t.Fatalf("stream after one failed dial dialed %v, want pool 4 again", dialedPool(dial))
+	}
+	c.advance(5 * time.Second)
+	a.DialFailed()
+	dial.ReleaseUnconnected()
+	for i := 0; i < 3; i++ {
+		s := a.Allocate("hub:443")
+		if s.Pool() > 3 || s.Warmup() != nil {
+			t.Fatalf("stream during the hold on pool %d dialing %v, want one of the four in use and no dial",
+				s.Pool(), dialedPool(s.Warmup()))
+		}
+		s.Release()
+	}
+	c.advance(dialHoldOff + time.Second)
+	if dial := a.Allocate("hub:443").Warmup(); dial == nil || dial.Pool() != 4 {
+		t.Fatalf("stream after the hold dialed %v, want pool 4 again", dialedPool(dial))
+	}
+}
+
+// dialedPool names the pool a warm-up dials, for failure messages.
+func dialedPool(warmup *Stream) any {
+	if warmup == nil {
+		return "nothing"
+	}
+	return warmup.Pool()
+}
+
+// A first connection and the backup Chromium races against it time out
+// together: two failures that close are one, and hold nothing off.
+func TestBackupDialFailureCountsOnce(t *testing.T) {
+	a, c := newTestAllocator(16)
+	connectedBurst(a, "hub:443", 8)
+	a.DialFailed()
+	c.advance(250 * time.Millisecond)
+	a.DialFailed()
+	if dial := a.Allocate("hub:443").Warmup(); dial == nil || dial.Pool() != 4 {
+		t.Fatalf("stream after one failed connect (two dials) dialed %v, want fresh pool 4", dialedPool(dial))
+	}
+}
+
+// During a hold a slot whose streams are all still dialing needs a dial as
+// much as an empty one: the next stream goes to a slot with a connected
+// stream, however busier.
+func TestHoldSkipsSlotsStillDialing(t *testing.T) {
+	a, c := newTestAllocator(16)
+	connectedBurst(a, "a:443", 4) // pools 0 and 1, two each
+	dialing := a.Allocate("a:443").Warmup()
+	if dialing == nil || dialing.Pool() != 2 {
+		t.Fatalf("setup: fifth stream to a:443 dialed %v, want 2", dialedPool(dialing))
+	}
+	failTwice(a, c)
+	for i := 0; i < 4; i++ {
+		if s := a.Allocate("e:443"); s.Pool() > 1 {
+			t.Fatalf("stream during the hold on pool %d, a slot without a session", s.Pool())
+		}
+	}
+}
+
+// A stream that fails to connect on a slot a connected stream drained from
+// moments ago leaves it cold: that session is gone.
+func TestUnconnectedReleaseColdsWarmSlot(t *testing.T) {
+	a, c := newTestAllocator(16)
+	connectedBurst(a, "a:443", 4) // pools 0 and 1, two each
+	drained := a.Allocate("a:443").Warmup()
+	if drained == nil || drained.Pool() != 2 {
+		t.Fatalf("setup: fifth stream to a:443 dialed %v, want 2", dialedPool(drained))
+	}
+	drained.Connected()
+	drained.Release()
+	failed := a.Allocate("a:443")
+	if failed.Pool() != 2 {
+		t.Fatalf("setup: stream after the drain on pool %d, want the warm slot 2", failed.Pool())
+	}
+	failed.ReleaseUnconnected()
+	failTwice(a, c)
+	for i := 0; i < 4; i++ {
+		if s := a.Allocate("e:443"); s.Pool() > 1 {
+			t.Fatalf("stream during the hold on pool %d, whose session failed", s.Pool())
+		}
+	}
+}
+
+// A stream dropped before it connected leaves no warm slot behind: expansion
+// takes the slot a connected stream drained from over the one an abandoned
+// dial drained from later.
+func TestAbandonedDialLeavesSlotCold(t *testing.T) {
+	a, c := newTestAllocator(16)
+	for i := 0; i < 4; i++ {
+		a.Allocate("a:443") // pools 0 and 1, two each, all still dialing
+	}
+	abandoned := []*Stream{a.Allocate("a:443"), a.Allocate("a:443")}
+	warm := connectedStream(a, "a:443")
+	if abandoned[0].Pool() != 2 || abandoned[1].Pool() != 2 || warm.Pool() != 3 {
+		t.Fatalf("setup: placed %d %d %d, want 2 2 3", abandoned[0].Pool(), abandoned[1].Pool(), warm.Pool())
+	}
+	warm.Release()
+	c.advance(time.Second)
+	abandoned[0].Release()
+	abandoned[1].Release()
+	if s := a.Allocate("a:443"); s.Pool() != 3 {
+		t.Fatalf("expansion picked pool %d, want slot 3 that had a session over slot 2 that never did", s.Pool())
+	}
+}
+
+// Fixed pools hold off the same way: a slot never connected is skipped while
+// dials are held off.
+func TestFixedModeHoldSkipsUnconnectedSlots(t *testing.T) {
+	c := &clock{at: time.Unix(1_000_000, 0)}
+	a := NewFixed(3)
+	a.now = c.now
+	first, second := connectedStream(a, "a:443"), connectedStream(a, "b:443")
+	failTwice(a, c)
+	for i := 0; i < 4; i++ {
+		s := a.Allocate("d:443")
+		if s.Pool() != first.Pool() && s.Pool() != second.Pool() {
+			t.Fatalf("fixed-mode stream during the hold on pool %d, want %d or %d", s.Pool(), first.Pool(), second.Pool())
+		}
+	}
+}
+
+// With no pool up there is nothing to ride: failed dials do not stop the next
+// stream from dialing.
+func TestFailedDialWithNothingUpStillDials(t *testing.T) {
+	a, c := newTestAllocator(16)
+	a.Allocate("hub:443").ReleaseUnconnected()
+	failTwice(a, c)
+	if s := a.Allocate("hub:443"); s.Pool() != 0 {
+		t.Fatalf("stream after failed dials on pool %d, want 0", s.Pool())
+	}
+}
+
+// After an idle spell only the heartbeat's session is up. A burst to one
+// destination rides it while the one fresh pool it would have spread onto
+// dials, instead of waiting a TCP and a TLS round trip on fresh pools. Once
+// that dial connects the usual caps are back: the next streams go two to a
+// destination onto the new session, none onto the pool the burst crowded.
+func TestBurstAfterIdleRidesTheWarmSession(t *testing.T) {
+	a, c := newTestAllocator(16)
+	connectedStream(a, "probe:443").Release()
+	c.advance(60 * time.Second)
+
+	var dials []*Stream
+	for i := 0; i < 8; i++ {
+		s := a.Allocate("hub:443")
+		if s.Pool() != 0 {
+			t.Fatalf("burst stream %d on pool %d, want the warm pool 0", i, s.Pool())
+		}
+		if s.Warmup() != nil {
+			dials = append(dials, s.Warmup())
+		}
+	}
+	if len(dials) != 1 || dials[0].Pool() != 1 {
+		t.Fatalf("burst dialed %d times, want pool 1 once", len(dials))
+	}
+	dials[0].Connected()
+	dials[0].Release()
+	for i := 0; i < 2; i++ {
+		if s := a.Allocate("hub:443"); s.Pool() != 1 || s.Warmup() != nil {
+			t.Fatalf("stream %d after the dial connected on pool %d dialing %v, want pool 1 and no dial",
+				i, s.Pool(), dialedPool(s.Warmup()))
+		}
+	}
+}
+
+// A bigger burst piles no more than maxActivesWhileDialing onto the warm
+// session; the rest wait for dials as before, on no more connections than the
+// burst opened before (eight, two streams each).
+func TestBurstOverflowIsBounded(t *testing.T) {
+	a, c := newTestAllocator(16)
+	connectedStream(a, "probe:443").Release()
+	c.advance(60 * time.Second)
+
+	onWarm := 0
+	for i := 0; i < 16; i++ {
+		if a.Allocate("hub:443").Pool() == 0 {
+			onWarm++
+		}
+	}
+	if onWarm != maxActivesWhileDialing {
+		t.Fatalf("%d of 16 streams rode the warm session, want %d", onWarm, maxActivesWhileDialing)
+	}
+	if a.InUse() > 16/sameDestinationCap {
+		t.Fatalf("burst of 16 spread over %d connections, more than the %d it opened before", a.InUse(), 16/sameDestinationCap)
+	}
+}
+
+// A pool carrying bulk takes no overflow: a stream that would wait for a dial
+// still waits, rather than queue behind the elephant on the one session up.
+func TestNoOverflowOntoAnElephantsPool(t *testing.T) {
+	a, _ := newTestAllocator(16)
+	bulk := connectedStream(a, "bulk:443")
+	bulk.Note(5 << 20)
+	if s := a.Allocate("page:443"); s.Pool() == bulk.Pool() || s.Warmup() != nil {
+		t.Fatalf("stream beside a lone elephant on pool %d dialing %v, want its own pool and no warm-up",
+			s.Pool(), dialedPool(s.Warmup()))
+	}
+}
+
+// Fixed pools are an explicit setting: placement stays least busy across all
+// of them, and no stream rides a session in another pool's stead.
+func TestFixedModeDoesNotOverflow(t *testing.T) {
+	a := NewFixed(4)
+	first := connectedStream(a, "a:443")
+	if s := a.Allocate("b:443"); s.Pool() == first.Pool() || s.Warmup() != nil {
+		t.Fatalf("fixed-mode second stream on pool %d dialing %v, want another pool and no warm-up",
+			s.Pool(), dialedPool(s.Warmup()))
 	}
 }
