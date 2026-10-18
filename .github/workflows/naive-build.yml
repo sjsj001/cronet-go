@@ -17,6 +17,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The other jobs run test/ only, after building Chromium; nothing ran the
+  # unit tests of this module or of pool/. They need no native library: under
+  # with_purego nothing is loaded until an engine is made.
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ^1.25
+      - name: Test
+        run: go test -race -tags with_purego . ./pool/
   linux:
     runs-on: ubuntu-24.04
     strategy:
