@@ -611,7 +611,14 @@ jobs:
 
       - name: Install iperf3 (Windows)
         if: runner.os == 'Windows'
-        run: choco install iperf3
+        shell: pwsh
+        # The choco package downloads from files.budman.pw, which no longer resolves.
+        run: |
+          $zip = "$env:RUNNER_TEMP\iperf3.zip"
+          Invoke-WebRequest https://github.com/ar51an/iperf3-win-builds/releases/download/3.22/iperf-3.22-win64.zip -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne 'C9FEABB3D721039508CCB81F74C2ADA3AE11B9E75D33D24510573C2AA21DA420') { throw 'iperf3 zip hash mismatch' }
+          Expand-Archive $zip "$env:RUNNER_TEMP\iperf3"
+          "$env:RUNNER_TEMP\iperf3" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
 
       # CGO mode tests
       - name: Run integration tests (CGO)
